@@ -253,38 +253,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libavcodec.xcframework.zip",
-            checksum: "6ccb6b5cf8fc05665f2ee4958f640b328755414946e9541adda40c536568ec43"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libavcodec.xcframework.zip",
+            checksum: "1e0f11fcf7cd386a13e851dea867207fd39a94d70e6d22dceda60d7f5f579cdb"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libavdevice.xcframework.zip",
-            checksum: "f571fbdef20e8d94ce6c8692eeee1fdff627e691cfcd2de5f9f294655c8cc405"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libavdevice.xcframework.zip",
+            checksum: "8e6da758d066529df6febce8146154e313bcf502308a8a6c1c133b9dcd20817f"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libavformat.xcframework.zip",
-            checksum: "7ff0af2e5ee5a1f5d278caedb96a395c7c29f563f09cdf977b6670bc9724cb7d"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libavformat.xcframework.zip",
+            checksum: "7098eebd3718bf2458da218cda4091582b8b192fee887a26a640f83e948ca024"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libavfilter.xcframework.zip",
-            checksum: "965d1271c37181b1fe23d34d0c7c1cb7626a080d5925d3bdb1d1f84afd7b3d7d"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libavfilter.xcframework.zip",
+            checksum: "a6ee6c0afcf3a868da3c6274ffaac4aceed8c3f206ea12d9eeb7dcdbe363bd5f"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libavutil.xcframework.zip",
-            checksum: "7a8716f9ac793e2da895b9f87c37b56a9a2065f2c1f31b60f3d3589bea6c50a1"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libavutil.xcframework.zip",
+            checksum: "af124e80eceef3755f8aafb8c8846e3b66932670ba5d89a923cbda007e72519c"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libswresample.xcframework.zip",
-            checksum: "7beb6e337b69882771c58281d42a449d8810e836e7ce07c6f91827267ab4fabd"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libswresample.xcframework.zip",
+            checksum: "ebb8b944bacfcf3f4503a0009cbb5680ed10dcbf1aca0d6e6d9d716112815f5a"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libswscale.xcframework.zip",
-            checksum: "e9d660dc6eb27d20a25aa5659a966f07cf1a97ed9049ec19e8a06b3f2aec6b41"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libswscale.xcframework.zip",
+            checksum: "175b665b09b14fe27da42874023cee65d4a87ee2d774bd996cec49ec0a27d301"
         ),
 
         .binaryTarget(
@@ -301,8 +301,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/mpvkit/MPVKit/releases/download/0.41.0/Libmpv.xcframework.zip",
-            checksum: "9ff5077d675a1e12bec98db167a49f46eb57dba567f40558b7758d4f12fb3ae7"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.1/Libmpv.xcframework.zip",
+            checksum: "6027cb336ae54deddba02fd71db138dbf0d3ae8c700cade1cde8bd086fba12dd"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
