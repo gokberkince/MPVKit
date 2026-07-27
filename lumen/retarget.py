@@ -16,4 +16,11 @@ s, n = re.subn(r'case \.vulkan:\n\s*return "https://[^"]*"',
 if n != 1:
     sys.exit("vulkan URL template not found — upstream moved it, update lumen/retarget.py")
 MAIN.write_text(s)
-print("retargeted: hosts + MoltenVK asset")
+TARGET = re.compile(r'name: "MoltenVK",\n\s*url: "[^"]*",\n\s*checksum: "[^"]*"')
+s2 = MAIN.read_text()
+CKURL = MOLTENVK_ALL.replace("MoltenVK-all.zip", "MoltenVK.xcframework")
+s2, n2 = TARGET.subn('name: "MoltenVK",\n                    url: "%s.zip",\n                    checksum: "%s.checksum.txt"' % (CKURL, CKURL), s2, count=1)
+if n2 != 1:
+    sys.exit("MoltenVK targets template not found — update lumen/retarget.py")
+MAIN.write_text(s2)
+print("retargeted: hosts + MoltenVK asset + MoltenVK package template")

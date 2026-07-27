@@ -318,8 +318,8 @@ enum Library: String, CaseIterable {
             return  [
                 .target(
                     name: "MoltenVK",
-                    url: "https://github.com/mpvkit/moltenvk-build/releases/download/\(self.version)/MoltenVK.xcframework.zip",
-                    checksum: "https://github.com/mpvkit/moltenvk-build/releases/download/\(self.version)/MoltenVK.xcframework.checksum.txt"
+                    url: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.2/MoltenVK.xcframework.zip",
+                    checksum: "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.2/MoltenVK.xcframework.checksum.txt"
                 ),
             ]
         case .libshaderc:
