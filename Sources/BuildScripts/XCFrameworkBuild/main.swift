@@ -129,7 +129,7 @@ enum Library: String, CaseIterable {
         case .libdovi:
             return "https://github.com/mpvkit/libdovi-build/releases/download/\(self.version)/libdovi-all.zip"
         case .vulkan:
-            return "https://github.com/mpvkit/moltenvk-build/releases/download/\(self.version)/MoltenVK-all.zip"
+            return "https://github.com/gokberkince/MPVKit/releases/download/0.41.0-lumen.2/MoltenVK-all.zip"
         case .libshaderc:
             return "https://github.com/mpvkit/libshaderc-build/releases/download/\(self.version)/libshaderc-all.zip"
         case .libuchardet:
