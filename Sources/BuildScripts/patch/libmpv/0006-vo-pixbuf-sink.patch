@@ -1,9 +1,44 @@
+--- a/options/options.h
++++ b/options/options.h
+@@ -69,6 +69,7 @@
+     bool show_in_taskbar;
+ 
+     int64_t WinID;
++    int64_t pixbuf_sink;
+ 
+     float force_monitor_aspect;
+     float monitor_pixel_aspect;
+--- a/options/options.c
++++ b/options/options.c
+@@ -171,6 +171,7 @@
+         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
+     {"video-recenter", OPT_BOOL(recenter)},
+     {"wid", OPT_INT64(WinID), .flags = UPDATE_VO},
++    {"vo-pixbuf-sink", OPT_INT64(pixbuf_sink)},
+     {"screen", OPT_CHOICE(screen_id, {"default", -1}), M_RANGE(0, 32)},
+     {"screen-name", OPT_STRING(screen_name)},
+     {"fs-screen", OPT_CHOICE(fsscreen_id, {"all", -2}, {"current", -1}),
+@@ -242,9 +243,11 @@
+         {"round", DWMWCP_ROUND},
+         {"roundsmall", DWMWCP_ROUNDSMALL})},
+ #endif
+-#if HAVE_EGL_ANDROID
++    /* mpv-iOS: surface-size always available so the iOS Swift wrapper can
++     * trigger VOCTRL_EXTERNAL_RESIZE on layer-bounds changes (CALayer KVO
++     * is unreliable). Hits player/command.c which calls
++     * vo_control(VOCTRL_EXTERNAL_RESIZE) → vo_gpu_next reconfig + resize. */
+     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
+-#endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+ #endif
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
-@@ -34,6 +34,20 @@
+@@ -33,6 +33,21 @@
+ #include "options/options.h"
  #include "misc/bstr.h"
  #include "vo.h"
- 
++
 +#ifdef __APPLE__
 +#include <CoreVideo/CoreVideo.h>
 +
@@ -21,7 +56,7 @@
  #include "aspect.h"
  #include "dr_helper.h"
  #include "input/input.h"
-@@ -121,6 +135,7 @@
+@@ -120,6 +135,7 @@
  };
  
  struct vo_internal {
@@ -29,33 +64,80 @@
      mp_thread thread;
      struct mp_dispatch_queue *dispatch;
      struct dr_helper *dr_helper;
-@@ -912,7 +927,25 @@
+@@ -911,7 +927,72 @@
              break;
      }
      mp_mutex_unlock(&in->lock);
 +}
 +
 +#ifdef __APPLE__
++// Software frames wrapped for the sink: interlaced broadcast H.264 never hardware-decodes on
++// iOS — VideoToolbox does not accept field-coded streams — so live TV arrives as plain yuv420
++// and PiP would starve without this. IOSurface-backed NV12 so the display layer shows it
++// without a further conversion; one packed copy per frame is the price.
++static void *tap_wrap_sw_frame(struct mp_image *img)
++{
++    if (img->imgfmt != IMGFMT_420P || img->num_planes < 3)
++        return NULL;
++    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 1,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionaryRef surf = CFDictionaryCreate(NULL, NULL, NULL, 0,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surf);
++    CFRelease(surf);
++    CVPixelBufferRef pb = NULL;
++    CVReturn err = CVPixelBufferCreate(NULL, img->w, img->h,
++        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pb);
++    CFRelease(attrs);
++    if (err != kCVReturnSuccess || !pb)
++        return NULL;
++    CVPixelBufferLockBaseAddress(pb, 0);
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
++    size_t pitch_y = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
++    for (int y = 0; y < img->h; y++)
++        memcpy(dst_y + (size_t)y * pitch_y,
++               img->planes[0] + (ptrdiff_t)y * img->stride[0], img->w);
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
++    size_t pitch_uv = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
++    int ch = (img->h + 1) / 2, cw = (img->w + 1) / 2;
++    for (int y = 0; y < ch; y++) {
++        const uint8_t *u = img->planes[1] + (ptrdiff_t)y * img->stride[1];
++        const uint8_t *v = img->planes[2] + (ptrdiff_t)y * img->stride[2];
++        uint8_t *row = dst_uv + (size_t)y * pitch_uv;
++        for (int x = 0; x < cw; x++) {
++            row[2 * x] = u[x];
++            row[2 * x + 1] = v[x];
++        }
++    }
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++    return pb;
++}
++
 +static void tap_pixbuf(struct vo *vo, struct vo_frame *frame)
 +{
 +    struct mp_pixbuf_sink *sink = (void *)(intptr_t)vo->opts->pixbuf_sink;
 +    if (!sink || !sink->frame || !frame || !frame->current)
 +        return;
 +    struct mp_image *img = frame->current;
-+    if (img->imgfmt != IMGFMT_VIDEOTOOLBOX || !img->planes[3])
++    if (img == vo->in->last_tapped_pixbuf)
 +        return;
-+    void *pixbuf = img->planes[3];
-+    if (pixbuf == vo->in->last_tapped_pixbuf)
++    vo->in->last_tapped_pixbuf = img;
++    void *pixbuf = NULL;
++    if (img->imgfmt == IMGFMT_VIDEOTOOLBOX && img->planes[3]) {
++        pixbuf = img->planes[3];
++        CVPixelBufferRetain((CVPixelBufferRef)pixbuf);
++    } else {
++        pixbuf = tap_wrap_sw_frame(img);
++    }
++    if (!pixbuf)
 +        return;
-+    vo->in->last_tapped_pixbuf = pixbuf;
-+    CVPixelBufferRetain((CVPixelBufferRef)pixbuf);
 +    sink->frame(sink->ctx, pixbuf, frame->pts / 1e9);
  }
 +#endif
  
  static bool render_frame(struct vo *vo)
  {
-@@ -1007,6 +1040,11 @@
+@@ -1006,6 +1087,11 @@
  
          stats_time_start(in->stats, "video-draw");
  
