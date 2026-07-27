@@ -28,6 +28,7 @@ jobs:
           cp -R Sources/BuildScripts/patch /tmp/overlay/patch
           cp -R lumen /tmp/overlay/lumen
           cp .github/workflows/lumen-sync.yml /tmp/overlay/lumen-sync.yml
+          cp .github/workflows/ci.yml /tmp/overlay/ci.yml
           git reset --hard upstream/main
           mkdir -p Sources/BuildScripts
           rm -rf Sources/BuildScripts/patch
@@ -35,6 +36,7 @@ jobs:
           rm -rf lumen && cp -R /tmp/overlay/lumen lumen
           mkdir -p .github/workflows
           cp /tmp/overlay/lumen-sync.yml .github/workflows/lumen-sync.yml
+          cp /tmp/overlay/ci.yml .github/workflows/ci.yml
           python3 lumen/retarget.py
           git add -A
           git commit -m "sync: upstream $(git rev-parse --short upstream/main) + lumen overlay"
