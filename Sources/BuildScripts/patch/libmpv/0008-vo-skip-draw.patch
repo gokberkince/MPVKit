@@ -1,0 +1,62 @@
+--- a/options/options.h
++++ b/options/options.h
+@@ -70,6 +70,7 @@
+ 
+     int64_t WinID;
+     int64_t pixbuf_sink;
++    bool skip_draw;
+ 
+     float force_monitor_aspect;
+     float monitor_pixel_aspect;
+--- a/options/options.c
++++ b/options/options.c
+@@ -172,6 +172,7 @@
+     {"video-recenter", OPT_BOOL(recenter)},
+     {"wid", OPT_INT64(WinID), .flags = UPDATE_VO},
+     {"vo-pixbuf-sink", OPT_INT64(pixbuf_sink)},
++    {"vo-skip-draw", OPT_BOOL(skip_draw)},
+     {"screen", OPT_CHOICE(screen_id, {"default", -1}), M_RANGE(0, 32)},
+     {"screen-name", OPT_STRING(screen_name)},
+     {"fs-screen", OPT_CHOICE(fsscreen_id, {"all", -2}, {"current", -1}),
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -1213,7 +1213,19 @@
+         // background CAMetalLayer's drawable while PiP is exactly the consumer that must not.
+         tap_pixbuf(vo, frame);
+ #endif
+-        in->visible = vo->driver->draw_frame(vo, frame);
++        // Fork addition (Lumen): iOS refuses GPU work from a backgrounded app and does not merely
++        // fail the frame — it kills the command buffer, and MoltenVK reports the whole device
++        // lost: "Insufficient Permission (to submit GPU work from background)" →
++        // VK_ERROR_DEVICE_LOST (owner's device log, 2026-07-30). A lost VkDevice never comes back,
++        // so one trip to the lock screen left the player unable to present to ANY surface, in the
++        // PiP window or after returning to the app, spamming "Failed acquiring swapchain image"
++        // forever. The app sets this while it is not foreground and clears it on return.
++        //
++        // Decode and the pixel-buffer tap deliberately keep running: the tap sits BEFORE this
++        // point, so Picture in Picture is still fed while nothing is drawn. `wait_until` is kept
++        // too — it is the frame's pacing, and skipping it would turn a suspended draw into a spin.
++        bool skip_draw = vo->opts->skip_draw;
++        in->visible = skip_draw ? false : vo->driver->draw_frame(vo, frame);
+ 
+         stats_time_end(in->stats, "video-draw");
+ 
+@@ -1221,13 +1233,16 @@
+ 
+         stats_time_start(in->stats, "video-flip");
+ 
+-        vo->driver->flip_page(vo);
++        if (!skip_draw)
++            vo->driver->flip_page(vo);
+ 
+         struct vo_vsync_info vsync = {
+             .last_queue_display_time = -1,
+             .skipped_vsyncs = -1,
+         };
+-        if (vo->driver->get_vsync)
++        // Nothing was presented, so there is no feedback to ask for; the fallback below stamps a
++        // plausible time and the timing estimator carries on undisturbed.
++        if (vo->driver->get_vsync && !skip_draw)
+             vo->driver->get_vsync(vo, &vsync);
+ 
+         // Make up some crap if presentation feedback is missing.
