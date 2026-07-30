@@ -7,6 +7,14 @@ on:
         description: 'Release tag name (default mpv version)'
         default: ''
 
+env:
+  # The slices this fork actually ships. visionOS is NOT one of them: nothing consumes it, and
+  # FFmpeg's configure cannot even get through it here — libplacebo's pkg-config needs a vulkan
+  # module that is not built for xros, so `make build` dies before mpv is reached. Without this the
+  # GPL step fails first and takes the LGPL build and the release upload down with it, skipped.
+  # ci.yml was taught the same lesson in 5bc6710; this workflow was left behind.
+  LUMEN_PLATFORMS: ios,isimulator,macos,tvos,tvsimulator
+
 jobs:
   build:
     permissions:
@@ -70,7 +78,7 @@ jobs:
 
       - name: Build GPL version
         run: |
-          make build enable-gpl version=${{ env.RELEASE_VERSION }}
+          make build enable-gpl version=${{ env.RELEASE_VERSION }} platform=${{ env.LUMEN_PLATFORMS }}
 
           cd ./dist/release
           rename 's/-all\.zip/-GPL-all\.zip/' *-all.zip
@@ -92,7 +100,7 @@ jobs:
       
       - name: Build LGPL version
         run: |
-          make build version=${{ env.RELEASE_VERSION }}
+          make build version=${{ env.RELEASE_VERSION }} platform=${{ env.LUMEN_PLATFORMS }}
       
       
       - name: Update Package.swift

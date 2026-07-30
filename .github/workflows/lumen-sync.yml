@@ -29,6 +29,10 @@ jobs:
           cp -R lumen /tmp/overlay/lumen
           cp .github/workflows/lumen-sync.yml /tmp/overlay/lumen-sync.yml
           cp .github/workflows/ci.yml /tmp/overlay/ci.yml
+          # build.yml too: upstream's copy builds every platform, and the visionOS slice cannot
+          # configure here. Leaving it out of the overlay is how the platform limit gets reverted
+          # by the next sync and the next release fails the same way.
+          cp .github/workflows/build.yml /tmp/overlay/build.yml
           git reset --hard upstream/main
           mkdir -p Sources/BuildScripts
           rm -rf Sources/BuildScripts/patch
@@ -37,6 +41,7 @@ jobs:
           mkdir -p .github/workflows
           cp /tmp/overlay/lumen-sync.yml .github/workflows/lumen-sync.yml
           cp /tmp/overlay/ci.yml .github/workflows/ci.yml
+          cp /tmp/overlay/build.yml .github/workflows/build.yml
           python3 lumen/retarget.py
           git add -A
           git commit -m "sync: upstream $(git rev-parse --short upstream/main) + lumen overlay"
