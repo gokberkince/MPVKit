@@ -15,10 +15,12 @@
  };
  #endif
  #include "aspect.h"
-@@ -972,6 +980,101 @@
+@@ -970,8 +978,103 @@
+     }
+     CVPixelBufferUnlockBaseAddress(pb, 0);
      return pb;
- }
- 
++}
++
 +// An NV12 pixel buffer, addressed as an mp_image so the OSD can be drawn into it. The image is a
 +// BORROWED view: no talloc, no refcounted buffers — and `mp_image_is_writeable` answers true for
 +// exactly that shape, which is what lets libass blend straight into the caller's pixels.
@@ -53,8 +55,8 @@
 +    p.crop = (struct mp_rect){0, 0, view->w, view->h};
 +    mp_image_set_params(view, &p);
 +    return true;
-+}
-+
+ }
+ 
 +// The decoder's own buffer is not ours to write on — another frame is still being displayed from
 +// it — so the composite happens on a copy. NV12 in, NV12 out, IOSurface-backed like the software
 +// path's, so the display layer needs no further conversion.
@@ -117,7 +119,7 @@
  static void tap_pixbuf(struct vo *vo, struct vo_frame *frame)
  {
      struct mp_pixbuf_sink *sink = (void *)(intptr_t)vo->opts->pixbuf_sink;
-@@ -982,14 +1085,26 @@
+@@ -982,14 +1085,32 @@
          return;
      vo->in->last_tapped_pixbuf = img;
      void *pixbuf = NULL;
@@ -141,8 +143,14 @@
      }
      if (!pixbuf)
          return;
++    // The IMAGE's pts, not the frame's. `vo_frame.pts` is a display deadline on the system clock
++    // (mp_time_ns), while the OSD asks "which subtitle is showing at this point in the MEDIA" —
++    // handed a wall-clock number it matches nothing and draws nothing, which is exactly how this
++    // shipped silent the first time. `screenshot.c` passes `mpctx->video_pts` here for the same
++    // reason. The sink callback keeps the frame's pts: that one IS a presentation deadline, and
++    // the display layer times the mirror by it.
 +    if (drew_subtitles)
-+        tap_draw_subtitles(vo, (CVPixelBufferRef)pixbuf, img, frame->pts / 1e9);
++        tap_draw_subtitles(vo, (CVPixelBufferRef)pixbuf, img, img->pts);
      sink->frame(sink->ctx, pixbuf, frame->pts / 1e9);
  }
  #endif
