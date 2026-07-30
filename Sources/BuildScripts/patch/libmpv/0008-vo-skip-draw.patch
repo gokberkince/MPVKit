@@ -20,7 +20,232 @@
      {"fs-screen", OPT_CHOICE(fsscreen_id, {"all", -2}, {"current", -1}),
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
-@@ -1213,7 +1213,19 @@
+@@ -66,6 +66,8 @@
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
+ #include "sub/osd.h"
++#include "sub/draw_bmp.h"
++#include "video/sws_utils.h"
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+ 
+@@ -144,6 +146,9 @@
+ 
+ struct vo_internal {
+     void *last_tapped_pixbuf;
++    bool tap_logged_geometry;
++    bool skip_draw_active;
++    struct mp_sws_context *tap_sws;
+     mp_thread thread;
+     struct mp_dispatch_queue *dispatch;
+     struct dr_helper *dr_helper;
+@@ -263,6 +268,19 @@
+     struct vo *vo = p;
+ 
+     if (m_config_cache_update(vo->opts_cache)) {
++        // Coming back from a suspended draw has to repaint by itself. While playing it would
++        // happen anyway — decode never stopped, so the next frame arrives and is drawn — but a
++        // player PAUSED in the background has no next frame, and the redraw path that would have
++        // covered it is the one suspension closes. Without this the app returns to a window that
++        // holds whatever was on it before, until something else asks for a repaint.
++        bool was_skipping = vo->in->skip_draw_active;
++        vo->in->skip_draw_active = vo->opts->skip_draw;
++        if (was_skipping && !vo->opts->skip_draw) {
++            mp_mutex_lock(&vo->in->lock);
++            vo->in->request_redraw = true;
++            mp_mutex_unlock(&vo->in->lock);
++            vo_wakeup(vo);
++        }
+         read_opts(vo);
+         if (vo->driver->control) {
+             vo->driver->control(vo, VOCTRL_VO_OPTS_CHANGED, NULL);
+@@ -938,51 +956,9 @@
+ }
+ 
+ #ifdef __APPLE__
+-// Software frames wrapped for the sink: interlaced broadcast H.264 never hardware-decodes on
+-// iOS — VideoToolbox does not accept field-coded streams — so live TV arrives as plain yuv420
+-// and PiP would starve without this. IOSurface-backed NV12 so the display layer shows it
+-// without a further conversion; one packed copy per frame is the price.
+-static void *tap_wrap_sw_frame(struct mp_image *img)
+-{
+-    if (img->imgfmt != IMGFMT_420P || img->num_planes < 3)
+-        return NULL;
+-    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 1,
+-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+-    CFDictionaryRef surf = CFDictionaryCreate(NULL, NULL, NULL, 0,
+-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+-    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surf);
+-    CFRelease(surf);
+-    CVPixelBufferRef pb = NULL;
+-    CVReturn err = CVPixelBufferCreate(NULL, img->w, img->h,
+-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pb);
+-    CFRelease(attrs);
+-    if (err != kCVReturnSuccess || !pb)
+-        return NULL;
+-    CVPixelBufferLockBaseAddress(pb, 0);
+-    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+-    size_t pitch_y = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+-    for (int y = 0; y < img->h; y++)
+-        memcpy(dst_y + (size_t)y * pitch_y,
+-               img->planes[0] + (ptrdiff_t)y * img->stride[0], img->w);
+-    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+-    size_t pitch_uv = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+-    int ch = (img->h + 1) / 2, cw = (img->w + 1) / 2;
+-    for (int y = 0; y < ch; y++) {
+-        const uint8_t *u = img->planes[1] + (ptrdiff_t)y * img->stride[1];
+-        const uint8_t *v = img->planes[2] + (ptrdiff_t)y * img->stride[2];
+-        uint8_t *row = dst_uv + (size_t)y * pitch_uv;
+-        for (int x = 0; x < cw; x++) {
+-            row[2 * x] = u[x];
+-            row[2 * x + 1] = v[x];
+-        }
+-    }
+-    CVPixelBufferUnlockBaseAddress(pb, 0);
+-    return pb;
+-}
+-
+-// An NV12 pixel buffer, addressed as an mp_image so the OSD can be drawn into it. The image is a
+-// BORROWED view: no talloc, no refcounted buffers — and `mp_image_is_writeable` answers true for
+-// exactly that shape, which is what lets libass blend straight into the caller's pixels.
++// An NV12 pixel buffer, addressed as an mp_image. The image is a BORROWED view: no talloc, no
++// refcounted buffers — and `mp_image_is_writeable` answers true for exactly that shape, which is
++// what lets libass blend, and the scaler write, straight into the caller's pixels.
+ // The buffer must be locked by the caller for the life of the view.
+ static bool tap_view_nv12(CVPixelBufferRef pb, struct mp_image *view,
+                           const struct mp_image_params *source)
+@@ -1014,6 +990,60 @@
+     p.crop = (struct mp_rect){0, 0, view->w, view->h};
+     mp_image_set_params(view, &p);
+     return true;
++}
++
++// Software frames wrapped for the sink, through mpv's OWN scaler.
++//
++// This path is not an edge case: interlaced broadcast H.264 is never accepted by VideoToolbox, so
++// live TV decodes in software from the first frame; and any hardware session iOS reclaims — it
++// does that when the app is not in front — drops the file into software until the decoder is
++// rebuilt. Whatever the reason, the mirror only shows what this function can convert.
++//
++// It used to convert exactly one format, 8-bit `IMGFMT_420P`, by hand. Everything else returned
++// NULL, and a NULL here is not a dropped frame but a Picture in Picture window that goes black and
++// stays black while the app itself plays perfectly, because the app draws its own surface and never
++// comes through here (owner's device, 2026-07-30: Notification Center over a running PiP window).
++// 10-bit is the obvious next format, but hand-writing each one is how the first gap happened.
++// `mp_sws` already converts everything mpv can decode, so it does the work and the list of
++// supported formats stops being ours to maintain.
++static void *tap_wrap_sw_frame(struct vo *vo, struct mp_image *img)
++{
++    if (img->w <= 0 || img->h <= 0)
++        return NULL;
++    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 1,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionaryRef surf = CFDictionaryCreate(NULL, NULL, NULL, 0,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surf);
++    CFRelease(surf);
++    CVPixelBufferRef pb = NULL;
++    CVReturn err = CVPixelBufferCreate(NULL, img->w, img->h,
++        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pb);
++    CFRelease(attrs);
++    if (err != kCVReturnSuccess || !pb)
++        return NULL;
++
++    if (!vo->in->tap_sws) {
++        // Kept for the life of the vo: the scaler caches its conversion for the format pair it
++        // last saw, and rebuilding one per frame would throw that away every time.
++        vo->in->tap_sws = mp_sws_alloc(vo->in);
++        mp_sws_enable_cmdline_opts(vo->in->tap_sws, vo->global);
++    }
++
++    bool ok = false;
++    if (CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
++        struct mp_image view;
++        // The SOURCE's colorimetry on the destination too, so this is a format conversion and not
++        // a colour conversion: the mirror must look like the picture the player is showing.
++        if (tap_view_nv12(pb, &view, &img->params))
++            ok = mp_sws_scale(vo->in->tap_sws, &view, img) >= 0;
++        CVPixelBufferUnlockBaseAddress(pb, 0);
++    }
++    if (!ok) {
++        CVPixelBufferRelease(pb);
++        return NULL;
++    }
++    return pb;
+ }
+ 
+ // The decoder's own buffer is not ours to write on — another frame is still being displayed from
+@@ -1054,6 +1084,13 @@
+     }
+     CVPixelBufferUnlockBaseAddress(dst, 0);
+     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++    // The pixels are only half of a frame. A VideoToolbox buffer carries its colour primaries,
++    // transfer function, matrix, chroma siting and clean aperture as ATTACHMENTS, and a buffer
++    // made by CVPixelBufferCreate has none of them — whoever displays this copy then has to guess,
++    // and `CMVideoFormatDescriptionCreateForImageBuffer` builds the display layer's format
++    // description from exactly this. Copying the pixels without them hands the mirror a picture
++    // that is described differently from the one the player is showing.
++    CVBufferPropagateAttachments(src, dst);
+     return dst;
+ }
+ 
+@@ -1069,8 +1106,44 @@
+         return;
+     struct mp_image view;
+     if (tap_view_nv12(pb, &view, &source->params)) {
+-        osd_draw_on_image(vo->osd, osd_res_from_image_params(&view.params),
+-                          pts, OSD_DRAW_SUB_ONLY, &view);
++        // The resolution is built here rather than by `osd_res_from_image_params`, which derives
++        // `display_par` from the SOURCE's pixel aspect (`p_h / p_w`). This buffer has no pixel
++        // aspect to speak of — its planes are a byte-for-byte copy, square by construction — and
++        // handing libass the source's ratio laid the line out on a horizontally stretched canvas:
++        // the text came out small and pushed to the LEFT while its vertical position stayed right,
++        // which is exactly the axis `display_par` acts on (owner screenshots, 2026-07-30).
++        struct mp_osd_res res = {
++            .w = view.w,
++            .h = view.h,
++            .display_par = 1.0,
++        };
++        // One line per PiP session. The first probe already answered its question — the buffer,
++        // the source and the resolution we hand libass all agreed at 1920x802 with a square pixel
++        // aspect — so the line is NOT being blitted into a canvas of the wrong size. What is left
++        // is where libass PUT it inside that canvas, which is what this measures: the bounding box
++        // the renderer reports, and the first part's rectangle inside it. Centred text in a 1920
++        // wide canvas starts near 960 minus half its width; the owner's screenshots put it around
++        // a quarter of the way in, and this says whether libass agrees.
++        // Waits for a frame that actually HAS a subtitle. Bound to the first composited frame it
++        // fired on an empty list and measured nothing (owner's device log, 2026-07-30) — the first
++        // frame of a film is rarely one with a line on it.
++        if (!vo->in->tap_logged_geometry) {
++            struct sub_bitmap_list *probe =
++                osd_render(vo->osd, res, pts, OSD_DRAW_SUB_ONLY, mp_draw_sub_formats);
++            if (probe && probe->num_items > 0 && probe->items[0]->num_parts > 0) {
++                vo->in->tap_logged_geometry = true;
++                struct sub_bitmaps *item = probe->items[0];
++                struct sub_bitmap *first = &item->parts[0];
++                struct sub_bitmap *last = &item->parts[item->num_parts - 1];
++                MP_WARN(vo, "pip-sub layout: res %dx%d list %dx%d items %d parts %d fmt %d "
++                            "first %dx%d at %d,%d last at %d,%d\n",
++                        res.w, res.h, probe->w, probe->h, probe->num_items, item->num_parts,
++                        (int)item->format, first->dw, first->dh, first->x, first->y,
++                        last->x, last->y);
++            }
++            talloc_free(probe);
++        }
++        osd_draw_on_image(vo->osd, res, pts, OSD_DRAW_SUB_ONLY, &view);
+     }
+     CVPixelBufferUnlockBaseAddress(pb, 0);
+ }
+@@ -1097,7 +1170,7 @@
+             CVPixelBufferRetain((CVPixelBufferRef)pixbuf);
+         }
+     } else {
+-        pixbuf = tap_wrap_sw_frame(img);
++        pixbuf = tap_wrap_sw_frame(vo, img);
+         // The software path already owns a private copy, so the composite costs it nothing extra.
+         drew_subtitles = pixbuf != NULL && sink->want_subtitles;
+     }
+@@ -1213,7 +1286,19 @@
          // background CAMetalLayer's drawable while PiP is exactly the consumer that must not.
          tap_pixbuf(vo, frame);
  #endif
@@ -41,7 +266,7 @@
  
          stats_time_end(in->stats, "video-draw");
  
-@@ -1221,13 +1233,16 @@
+@@ -1221,13 +1306,16 @@
  
          stats_time_start(in->stats, "video-flip");
  
@@ -60,3 +285,18 @@
              vo->driver->get_vsync(vo, &vsync);
  
          // Make up some crap if presentation feedback is missing.
+@@ -1285,6 +1373,14 @@
+     if (!vo->config_ok)
+         return;
+ 
++    // The SECOND way into the driver, and the one that made --vo-skip-draw look like it did
++    // nothing: this path calls draw_frame and flip_page itself, so a redraw request — an OSD
++    // change, a repeat of the last frame — still submitted GPU work from a backgrounded app and
++    // still lost the device (owner's device log, 2026-07-30, the command buffer named
++    // "vkAcquireNextImageKHR"). Guarding render_frame alone was not enough.
++    if (vo->opts->skip_draw)
++        return;
++
+     mp_mutex_lock(&in->lock);
+     in->request_redraw = false;
+ 
