@@ -299,10 +299,13 @@ let package = Package(
             checksum: "3a171ef1627fb88260893dc452f989bd93dd8510814771ba3aff7753470d3f3e"
         ),
 
+        // Only libmpv moves to 0.42.0-lumen.4: nothing else was rebuilt from changed source, and
+        // leaving the rest on lumen.3 is what makes this manifest the exact set that was verified
+        // on hardware — a locally built libmpv against lumen.3's FFmpeg.
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/gokberkince/MPVKit/releases/download/0.42.0-lumen.3/Libmpv.xcframework.zip",
-            checksum: "464163fbf7a01492c7ddd7f3510c663c2d9f6fa3bb650a493cdd2ac95a57abfc"
+            url: "https://github.com/gokberkince/MPVKit/releases/download/0.42.0-lumen.4/Libmpv.xcframework.zip",
+            checksum: "6184f0bc80cf96b6ad52da44833b906eb94e9d3f51558e33f4d1fdc221200c9e"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
