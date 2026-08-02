@@ -748,6 +748,11 @@ private class BuildFFMPEG: BaseBuild {
         "--enable-filter=vflip", "--enable-filter=volume",
         "--enable-filter=w3fdif",
         "--enable-filter=yadif",
+        // Hardware deinterlace for the videotoolbox hwdec chain: the yadif kernel as a Metal
+        // compute shader over CVPixelBuffers (deps metal+corevideo+videotoolbox, all
+        // autodetected on Apple targets; the .metal source is compiled to an embedded
+        // metallib by FFmpeg's own build rules). LGPL — only x86 asm of yadif is GPL.
+        "--enable-filter=yadif_videotoolbox",
         "--enable-filter=avgblur_vulkan", "--enable-filter=blend_vulkan", "--enable-filter=bwdif_vulkan",
         "--enable-filter=chromaber_vulkan", "--enable-filter=flip_vulkan", "--enable-filter=gblur_vulkan",
         "--enable-filter=hflip_vulkan", "--enable-filter=nlmeans_vulkan", "--enable-filter=overlay_vulkan",

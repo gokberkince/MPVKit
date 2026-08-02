@@ -1,0 +1,16 @@
+diff --git a/filters/f_auto_filters.c b/filters/f_auto_filters.c
+index d7ee230..14160aa 100644
+--- a/filters/f_auto_filters.c
++++ b/filters/f_auto_filters.c
+@@ -112,6 +112,11 @@ static void deint_process(struct mp_filter *f)
+                         "parity", field_parity, NULL};
+         p->sub.filter =
+             mp_create_user_filter(f, MP_OUTPUT_CHAIN_VIDEO, "vavpp", args);
++    } else if (img->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++        char *args[] = {"mode", "send_field",
++                        "parity", field_parity, NULL};
++        p->sub.filter =
++            mp_create_user_filter(f, MP_OUTPUT_CHAIN_VIDEO, "yadif_videotoolbox", args);
+     } else {
+         has_filter = false;
+     }
