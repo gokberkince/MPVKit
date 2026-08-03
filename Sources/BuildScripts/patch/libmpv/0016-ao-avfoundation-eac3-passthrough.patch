@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 57c065a..72b9b63 100644
+index 57c065a..8578a77 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -48,6 +48,15 @@ - (void)handleRestartNotification:(NSNotification*)notification;
@@ -18,13 +18,15 @@ index 57c065a..72b9b63 100644
  };
  
  static int64_t CMTimeGetNanoseconds(CMTime time)
-@@ -61,9 +70,127 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+@@ -61,9 +70,135 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
      return CMTimeMake(time, 1000000000);
  }
  
 +#define IEC61937_EAC3 21
 +#define EAC3_FRAME_SAMPLES 1536
-+#define EAC3_BURST_BUF_MAX 65536
++// The IEC link runs at 4x, so one 100 ms read is 192000/10 * 4 B = 76.8 KiB; the buffer
++// holds two reads plus a carried burst with room to spare.
++#define EAC3_BURST_BUF_MAX 262144
 +
 +// The passthrough lane. ad_spdif hands us IEC 61937 bursts on a 2ch/16bit carrier; each
 +// burst holds ONE E-AC-3 syncframe, 16-bit byteswapped. Unwrapped and fed as raw
@@ -38,11 +40,17 @@ index 57c065a..72b9b63 100644
 +    int samplerate = ao->samplerate; // the IEC link rate; frames play at p->eac3_rate
 +    int sstride = ao->sstride;
 +
++    // The read is CLAMPED to the space left, never guarded after the fact: a request
++    // larger than the remainder would let ao_read_data write past the buffer.
 +    int request_sample_count = samplerate / 10;
-+    int buffer_size = request_sample_count * sstride;
-+    if (p->burst_len + buffer_size > EAC3_BURST_BUF_MAX) {
-+        MP_WARN(ao, "eac3: burst reassembly overflow, resyncing\n");
++    int space = (EAC3_BURST_BUF_MAX - p->burst_len) / sstride;
++    if (request_sample_count > space)
++        request_sample_count = space;
++    if (request_sample_count <= 0) {
++        // A full buffer with no complete burst inside is garbage input, not backlog.
++        MP_WARN(ao, "eac3: burst reassembly stalled, resyncing\n");
 +        p->burst_len = 0;
++        return;
 +    }
 +    void *data[] = {p->burst_buf + p->burst_len};
 +
@@ -146,7 +154,7 @@ index 57c065a..72b9b63 100644
      int samplerate = ao->samplerate;
      int sstride = ao->sstride;
  
-@@ -148,6 +275,8 @@ static void start(struct ao *ao)
+@@ -148,6 +283,8 @@ static void start(struct ao *ao)
      struct priv *p = ao->priv;
  
      p->end_time_av = -1;
@@ -155,7 +163,7 @@ index 57c065a..72b9b63 100644
      [p->synchronizer setRate:1];
      [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
          feed(ao);
-@@ -227,6 +356,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+@@ -227,6 +364,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
          [p->renderer flush];
          [p->synchronizer setRate:0];
          p->end_time_av = -1;
@@ -164,7 +172,7 @@ index 57c065a..72b9b63 100644
          [p->synchronizer setRate:1];
          [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
              feed(ao_);
-@@ -284,45 +415,70 @@ static int init(struct ao *ao)
+@@ -284,45 +423,70 @@ static int init(struct ao *ao)
  #endif
  
      if (af_fmt_is_spdif(ao->format)) {
