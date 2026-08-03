@@ -1,0 +1,370 @@
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -36,6 +36,8 @@
+ 
+ #ifdef __APPLE__
+ #include <CoreVideo/CoreVideo.h>
++#include <libavutil/hwcontext_videotoolbox.h>
++#include "video/fmt-conversion.h"
+ 
+ // Fork addition (Lumen): hands every displayed frame to the embedding app, which feeds
+ // AVSampleBufferDisplayLayer for system Picture in Picture. Upstream has no AVFoundation vo,
+@@ -66,7 +68,6 @@
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
+ #include "sub/osd.h"
+-#include "sub/draw_bmp.h"
+ #include "video/sws_utils.h"
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+@@ -146,7 +147,7 @@
+ 
+ struct vo_internal {
+     void *last_tapped_pixbuf;
+-    bool tap_logged_geometry;
++    uint64_t tap_buffer_key;
+     bool skip_draw_active;
+     struct mp_sws_context *tap_sws;
+     mp_thread thread;
+@@ -956,34 +957,69 @@
+ }
+ 
+ #ifdef __APPLE__
+-// An NV12 pixel buffer, addressed as an mp_image. The image is a BORROWED view: no talloc, no
++// The mpv format that describes the SAME BYTES the pixel buffer holds — asked, never assumed.
++//
++// A VideoToolbox buffer is whatever the decoder chose. 8-bit 4:2:0 is `420v`/`420f`, but HEVC
++// Main10 and Dolby Vision profile 8 — which is most of what this app plays — come back `x420`,
++// where every sample is TWO bytes, and the professional profiles add 4:2:2 and 4:4:4 on top of
++// that (`libavcodec/videotoolbox.c`, `videotoolbox_best_pixel_format`).
++//
++// This used to answer IMGFMT_NV12 for all of them, gated on nothing but a plane count of two,
++// which `x420` also has. The subtitle composite then wrote one byte per sample into planes that
++// store two: libass laid the line out correctly — measured, dead centre of a 1920 wide canvas —
++// and every x coordinate and every width was halved on the way into memory, so the text arrived
++// half as wide with its centre a QUARTER of the way in, while the rows, which are addressed by
++// the buffer's own stride, stayed exactly right. Condensed and shoved left, correct height,
++// correct vertical position; and correct on the software path below, which has always made 8-bit
++// buffers, which is what made it look like the two paths ran different code (owner's device,
++// 2026-07-30 and 2026-07-31).
++//
++// FFmpeg's own table does the mapping and mpv's generic AVPixelFormat range catches everything
++// that is not in its own list, so a format Apple adds later needs no change here.
++static int tap_imgfmt(CVPixelBufferRef pb)
++{
++    enum AVPixelFormat av =
++        av_map_videotoolbox_format_to_pixfmt(CVPixelBufferGetPixelFormatType(pb));
++    return av == AV_PIX_FMT_NONE ? 0 : pixfmt2imgfmt(av);
++}
++
++// A pixel buffer, addressed as an mp_image. The image is a BORROWED view: no talloc, no
+ // refcounted buffers — and `mp_image_is_writeable` answers true for exactly that shape, which is
+ // what lets libass blend, and the scaler write, straight into the caller's pixels.
+ // The buffer must be locked by the caller for the life of the view.
+-static bool tap_view_nv12(CVPixelBufferRef pb, struct mp_image *view,
+-                          const struct mp_image_params *source)
++static bool tap_view_pixbuf(CVPixelBufferRef pb, struct mp_image *view,
++                            const struct mp_image_params *source)
+ {
+-    if (CVPixelBufferGetPlaneCount(pb) != 2)
++    int imgfmt = tap_imgfmt(pb);
++    if (!imgfmt)
+         return false;
+-    void *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+-    void *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+-    if (!y || !uv)
++    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
++    // A PACKED buffer reports no planes at all and answers only the non-planar accessors; the
++    // alpha formats (`kCVPixelFormatType_4444AYpCbCr8`) are the ones that arrive that way. The
++    // old plane count check refused them silently, and a Picture in Picture window simply opened
++    // with no subtitles and no complaint.
++    size_t cv_planes = CVPixelBufferGetPlaneCount(pb);
++    if (desc.num_planes < 1 || desc.num_planes != (int)(cv_planes ? cv_planes : 1))
+         return false;
+ 
+     *view = (struct mp_image){0};
+-    mp_image_setfmt(view, IMGFMT_NV12);
++    mp_image_setfmt(view, imgfmt);
+     mp_image_set_size(view, (int)CVPixelBufferGetWidth(pb),
+                             (int)CVPixelBufferGetHeight(pb));
+-    view->planes[0] = y;
+-    view->stride[0] = (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+-    view->planes[1] = uv;
+-    view->stride[1] = (int)CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
++    for (int p = 0; p < desc.num_planes; p++) {
++        view->planes[p] = cv_planes ? CVPixelBufferGetBaseAddressOfPlane(pb, p)
++                                    : CVPixelBufferGetBaseAddress(pb);
++        view->stride[p] = cv_planes ? (int)CVPixelBufferGetBytesPerRowOfPlane(pb, p)
++                                    : (int)CVPixelBufferGetBytesPerRow(pb);
++        if (!view->planes[p])
++            return false;
++    }
+ 
+     // The source's colorimetry, but never its format or its crop: this buffer is the whole
+-    // picture in NV12, and a crop inherited from a hardware frame would place the subtitles
+-    // against a rectangle that does not exist here.
++    // picture, and a crop inherited from a hardware frame would place the subtitles against a
++    // rectangle that does not exist here.
+     struct mp_image_params p = *source;
+-    p.imgfmt = IMGFMT_NV12;
++    p.imgfmt = imgfmt;
+     p.hw_subfmt = 0;
+     p.w = view->w;
+     p.h = view->h;
+@@ -992,6 +1028,69 @@
+     return true;
+ }
+ 
++// The CoreVideo format for a mirrored SOFTWARE frame. The RANGE has to follow the source: the
++// view above carries the source's levels onto the destination, so `mp_sws_scale` converts format
++// and never levels — and full-range pixels written into a buffer whose format type SAYS limited
++// are described that way to the display layer and come back crushed.
++static OSType tap_sw_cvfmt(const struct mp_image_params *p)
++{
++    return p->repr.levels == PL_COLOR_LEVELS_FULL
++        ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
++        : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++}
++
++// What `CVBufferPropagateAttachments` gives the hardware path for free, spelled out for a buffer
++// this file just created. `CMVideoFormatDescriptionCreateForImageBuffer` builds the display
++// layer's format description from exactly these attachments, and a buffer carrying none of them
++// leaves the layer to GUESS from the frame size — 601 below standard definition, 709 above it.
++// Interlaced broadcast never hardware-decodes, so the software path is where BT.2020 and HLG
++// actually turn up, and those were mirrored in the wrong colours.
++//
++// Only exact mappings are written. An attachment nobody can be sure of is worse than the layer's
++// own guess, so anything unrecognised is left absent on purpose.
++static void tap_set_color_attachments(CVPixelBufferRef pb, const struct mp_image_params *p)
++{
++    CFStringRef matrix = NULL, primaries = NULL, transfer = NULL, chroma = NULL;
++    switch (p->repr.sys) {
++    case PL_COLOR_SYSTEM_BT_601:     matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4; break;
++    case PL_COLOR_SYSTEM_BT_709:     matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2; break;
++    case PL_COLOR_SYSTEM_BT_2020_NC: matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020;  break;
++    default: break;
++    }
++    switch (p->color.primaries) {
++    case PL_COLOR_PRIM_BT_601_525: primaries = kCVImageBufferColorPrimaries_SMPTE_C;     break;
++    case PL_COLOR_PRIM_BT_601_625: primaries = kCVImageBufferColorPrimaries_EBU_3213;    break;
++    case PL_COLOR_PRIM_BT_709:     primaries = kCVImageBufferColorPrimaries_ITU_R_709_2; break;
++    case PL_COLOR_PRIM_BT_2020:    primaries = kCVImageBufferColorPrimaries_ITU_R_2020;  break;
++    default: break;
++    }
++    switch (p->color.transfer) {
++    case PL_COLOR_TRC_BT_1886: transfer = kCVImageBufferTransferFunction_ITU_R_709_2;      break;
++    case PL_COLOR_TRC_SRGB:    transfer = kCVImageBufferTransferFunction_sRGB;             break;
++    case PL_COLOR_TRC_PQ:      transfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ; break;
++    case PL_COLOR_TRC_HLG:     transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG;   break;
++    default: break;
++    }
++    switch (p->chroma_location) {
++    case PL_CHROMA_LEFT:     chroma = kCVImageBufferChromaLocation_Left;    break;
++    case PL_CHROMA_CENTER:   chroma = kCVImageBufferChromaLocation_Center;  break;
++    case PL_CHROMA_TOP_LEFT: chroma = kCVImageBufferChromaLocation_TopLeft; break;
++    default: break;
++    }
++    if (matrix)
++        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix,
++                              kCVAttachmentMode_ShouldPropagate);
++    if (primaries)
++        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primaries,
++                              kCVAttachmentMode_ShouldPropagate);
++    if (transfer)
++        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transfer,
++                              kCVAttachmentMode_ShouldPropagate);
++    if (chroma)
++        CVBufferSetAttachment(pb, kCVImageBufferChromaLocationTopFieldKey, chroma,
++                              kCVAttachmentMode_ShouldPropagate);
++}
++
+ // Software frames wrapped for the sink, through mpv's OWN scaler.
+ //
+ // This path is not an edge case: interlaced broadcast H.264 is never accepted by VideoToolbox, so
+@@ -1018,7 +1117,7 @@
+     CFRelease(surf);
+     CVPixelBufferRef pb = NULL;
+     CVReturn err = CVPixelBufferCreate(NULL, img->w, img->h,
+-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pb);
++        tap_sw_cvfmt(&img->params), attrs, &pb);
+     CFRelease(attrs);
+     if (err != kCVReturnSuccess || !pb)
+         return NULL;
+@@ -1035,7 +1134,7 @@
+         struct mp_image view;
+         // The SOURCE's colorimetry on the destination too, so this is a format conversion and not
+         // a colour conversion: the mirror must look like the picture the player is showing.
+-        if (tap_view_nv12(pb, &view, &img->params))
++        if (tap_view_pixbuf(pb, &view, &img->params))
+             ok = mp_sws_scale(vo->in->tap_sws, &view, img) >= 0;
+         CVPixelBufferUnlockBaseAddress(pb, 0);
+     }
+@@ -1043,16 +1142,17 @@
+         CVPixelBufferRelease(pb);
+         return NULL;
+     }
++    tap_set_color_attachments(pb, &img->params);
+     return pb;
+ }
+ 
+ // The decoder's own buffer is not ours to write on — another frame is still being displayed from
+-// it — so the composite happens on a copy. NV12 in, NV12 out, IOSurface-backed like the software
+-// path's, so the display layer needs no further conversion.
+-static void *tap_copy_nv12(CVPixelBufferRef src)
++// it — so the composite happens on a copy. The copy keeps the source's own format, whatever it
++// is, and is IOSurface-backed like the software path's, so the display layer needs no further
++// conversion. Formats are not filtered here: what this file cannot COMPOSITE onto is decided by
++// `tap_view_pixbuf`, and a buffer it refuses still deserves to reach the mirror unpainted.
++static void *tap_copy_pixbuf(CVPixelBufferRef src)
+ {
+-    if (CVPixelBufferGetPlaneCount(src) != 2)
+-        return NULL;
+     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 1,
+         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+     CFDictionaryRef surf = CFDictionaryCreate(NULL, NULL, NULL, 0,
+@@ -1070,15 +1170,33 @@
+         return NULL;
+     }
+     CVPixelBufferLockBaseAddress(dst, 0);
+-    for (size_t plane = 0; plane < 2; plane++) {
+-        const uint8_t *from = CVPixelBufferGetBaseAddressOfPlane(src, plane);
+-        uint8_t *to = CVPixelBufferGetBaseAddressOfPlane(dst, plane);
+-        size_t from_pitch = CVPixelBufferGetBytesPerRowOfPlane(src, plane);
+-        size_t to_pitch = CVPixelBufferGetBytesPerRowOfPlane(dst, plane);
+-        size_t rows = CVPixelBufferGetHeightOfPlane(dst, plane);
+-        size_t bytes = MPMIN(from_pitch, to_pitch);
++    // A packed buffer reports NO planes and answers only the non-planar accessors; a planar one
++    // reports however many it has, which is two for every 4:2:0 and 4:2:2 format but need not be.
++    size_t cv_planes = CVPixelBufferGetPlaneCount(src);
++    for (size_t plane = 0; plane < (cv_planes ? cv_planes : 1); plane++) {
++        const uint8_t *from;
++        uint8_t *to;
++        size_t from_pitch, to_pitch, rows;
++        if (cv_planes) {
++            from = CVPixelBufferGetBaseAddressOfPlane(src, plane);
++            to = CVPixelBufferGetBaseAddressOfPlane(dst, plane);
++            from_pitch = CVPixelBufferGetBytesPerRowOfPlane(src, plane);
++            to_pitch = CVPixelBufferGetBytesPerRowOfPlane(dst, plane);
++            // Both, not just the destination's: the two agree today because `dst` is created with
++            // the source's own width, height and format, and reading past the source is the one
++            // way this loop could ever fault.
++            rows = MPMIN(CVPixelBufferGetHeightOfPlane(src, plane),
++                         CVPixelBufferGetHeightOfPlane(dst, plane));
++        } else {
++            from = CVPixelBufferGetBaseAddress(src);
++            to = CVPixelBufferGetBaseAddress(dst);
++            from_pitch = CVPixelBufferGetBytesPerRow(src);
++            to_pitch = CVPixelBufferGetBytesPerRow(dst);
++            rows = MPMIN(CVPixelBufferGetHeight(src), CVPixelBufferGetHeight(dst));
++        }
+         if (!from || !to)
+-            rows = 0;
++            continue;
++        size_t bytes = MPMIN(from_pitch, to_pitch);
+         for (size_t y = 0; y < rows; y++)
+             memcpy(to + y * to_pitch, from + y * from_pitch, bytes);
+     }
+@@ -1092,6 +1210,40 @@
+     // that is described differently from the one the player is showing.
+     CVBufferPropagateAttachments(src, dst);
+     return dst;
++}
++
++// What the mirror is actually being painted on, once per distinct buffer. Keyed on the shape
++// rather than fired once, so a run prints for the hardware decoder and prints AGAIN the moment
++// iOS takes the session away and mpv drops into software — the two paths side by side in one log,
++// and nothing per frame. The predecessor of this line measured where libass put the text and
++// proved it centred, which is precisely how the fault was traced past the layout and into the
++// destination: same canvas, same numbers, two different results, and the only remaining variable
++// was how many bytes a sample takes. `fmt` is the answer.
++static void tap_log_buffer(struct vo *vo, CVPixelBufferRef pb, struct mp_image *source,
++                           int imgfmt)
++{
++    OSType cv = CVPixelBufferGetPixelFormatType(pb);
++    uint64_t key = ((uint64_t)cv << 32)
++                 ^ ((uint64_t)CVPixelBufferGetWidth(pb) << 20)
++                 ^ ((uint64_t)CVPixelBufferGetHeight(pb) << 4)
++                 ^ (uint64_t)CVPixelBufferGetBytesPerRow(pb);
++    if (vo->in->tap_buffer_key == key)
++        return;
++    vo->in->tap_buffer_key = key;
++    MP_WARN(vo, "pip-sub buffer: cv %c%c%c%c %zux%zu planes %zu pitch %zu/%zu -> fmt %s | "
++                "img %dx%d %s[%s] crop %d,%d-%d,%d par %d:%d\n",
++            (char)(cv >> 24), (char)(cv >> 16), (char)(cv >> 8), (char)cv,
++            CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
++            CVPixelBufferGetPlaneCount(pb),
++            CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
++            CVPixelBufferGetBytesPerRowOfPlane(pb, 1),
++            imgfmt ? mp_imgfmt_to_name(imgfmt) : "REFUSED",
++            source->w, source->h,
++            mp_imgfmt_to_name(source->params.imgfmt),
++            mp_imgfmt_to_name(source->params.hw_subfmt),
++            source->params.crop.x0, source->params.crop.y0,
++            source->params.crop.x1, source->params.crop.y1,
++            source->params.p_w, source->params.p_h);
+ }
+ 
+ // `OSD_DRAW_SUB_ONLY`, never the OSD bar: the app draws its own chrome, and mpv's would arrive in
+@@ -1105,44 +1257,21 @@
+     if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess)
+         return;
+     struct mp_image view;
+-    if (tap_view_nv12(pb, &view, &source->params)) {
++    bool ok = tap_view_pixbuf(pb, &view, &source->params);
++    tap_log_buffer(vo, pb, source, ok ? view.imgfmt : 0);
++    if (ok) {
+         // The resolution is built here rather than by `osd_res_from_image_params`, which derives
+-        // `display_par` from the SOURCE's pixel aspect (`p_h / p_w`). This buffer has no pixel
+-        // aspect to speak of — its planes are a byte-for-byte copy, square by construction — and
+-        // handing libass the source's ratio laid the line out on a horizontally stretched canvas:
+-        // the text came out small and pushed to the LEFT while its vertical position stayed right,
+-        // which is exactly the axis `display_par` acts on (owner screenshots, 2026-07-30).
++        // `display_par` from the SOURCE's pixel aspect (`p_h / p_w`). This buffer is the picture
++        // itself, square by construction, and handing libass a ratio meant for the display would
++        // lay the line out on a stretched canvas. For square-pixel content the two agree — mpv
++        // normalises an unknown aspect to 1:1 in `f_decoder_wrapper.c` — so this was never the
++        // fault it was once thought to be; it is simply the correct thing to say, and it is the
++        // only thing that stays correct for anamorphic content.
+         struct mp_osd_res res = {
+             .w = view.w,
+             .h = view.h,
+             .display_par = 1.0,
+         };
+-        // One line per PiP session. The first probe already answered its question — the buffer,
+-        // the source and the resolution we hand libass all agreed at 1920x802 with a square pixel
+-        // aspect — so the line is NOT being blitted into a canvas of the wrong size. What is left
+-        // is where libass PUT it inside that canvas, which is what this measures: the bounding box
+-        // the renderer reports, and the first part's rectangle inside it. Centred text in a 1920
+-        // wide canvas starts near 960 minus half its width; the owner's screenshots put it around
+-        // a quarter of the way in, and this says whether libass agrees.
+-        // Waits for a frame that actually HAS a subtitle. Bound to the first composited frame it
+-        // fired on an empty list and measured nothing (owner's device log, 2026-07-30) — the first
+-        // frame of a film is rarely one with a line on it.
+-        if (!vo->in->tap_logged_geometry) {
+-            struct sub_bitmap_list *probe =
+-                osd_render(vo->osd, res, pts, OSD_DRAW_SUB_ONLY, mp_draw_sub_formats);
+-            if (probe && probe->num_items > 0 && probe->items[0]->num_parts > 0) {
+-                vo->in->tap_logged_geometry = true;
+-                struct sub_bitmaps *item = probe->items[0];
+-                struct sub_bitmap *first = &item->parts[0];
+-                struct sub_bitmap *last = &item->parts[item->num_parts - 1];
+-                MP_WARN(vo, "pip-sub layout: res %dx%d list %dx%d items %d parts %d fmt %d "
+-                            "first %dx%d at %d,%d last at %d,%d\n",
+-                        res.w, res.h, probe->w, probe->h, probe->num_items, item->num_parts,
+-                        (int)item->format, first->dw, first->dh, first->x, first->y,
+-                        last->x, last->y);
+-            }
+-            talloc_free(probe);
+-        }
+         osd_draw_on_image(vo->osd, res, pts, OSD_DRAW_SUB_ONLY, &view);
+     }
+     CVPixelBufferUnlockBaseAddress(pb, 0);
+@@ -1163,7 +1292,7 @@
+         // Only a viewer who is watching the mirror pays for a copy. Off — which is every frame
+         // while the player is on screen — this is the same single retain it has always been.
+         if (sink->want_subtitles)
+-            pixbuf = tap_copy_nv12((CVPixelBufferRef)img->planes[3]);
++            pixbuf = tap_copy_pixbuf((CVPixelBufferRef)img->planes[3]);
+         drew_subtitles = pixbuf != NULL;
+         if (!pixbuf) {
+             pixbuf = img->planes[3];
