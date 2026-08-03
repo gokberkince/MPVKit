@@ -1,0 +1,55 @@
+diff --git a/filters/f_auto_filters.c b/filters/f_auto_filters.c
+index 14160aa..a53b0d0 100644
+--- a/filters/f_auto_filters.c
++++ b/filters/f_auto_filters.c
+@@ -1,5 +1,7 @@
+ #include <math.h>
+ 
++#include "config.h"
++
+ #include "audio/aframe.h"
+ #include "audio/format.h"
+ #include "common/common.h"
+@@ -121,6 +123,42 @@ static void deint_process(struct mp_filter *f)
+         has_filter = false;
+     }
+ 
++#if HAVE_VIDEOTOOLBOX_GL || HAVE_VIDEOTOOLBOX_PL
++    if (!p->sub.filter && !has_filter) {
++        // The frames that most need deinterlacing on Apple never arrive as hw frames:
++        // VideoToolbox refuses field-coded H.264, so interlaced broadcast decodes in
++        // software. Ride autoconvert's own sw->hw lane up to a VT surface — f_hwtransfer
++        // requests the VideoToolbox interop from the VO on demand, which is the device a raw
++        // lavfi hwupload graph never had ("A hardware device reference is required", device
++        // tape 2026-08-03) — and run the Metal yadif on the uploaded frame. The output stays
++        // a VT frame the vo takes natively. Any failure leaves p->sub.filter unset and the
++        // bwdif path below runs unchanged.
++        struct mp_filter *subf = mp_bidir_dummy_filter_create(f);
++        struct mp_filter *filters[2] = {0};
++        bool ok = false;
++
++        struct mp_autoconvert *ac = mp_autoconvert_create(subf);
++        if (ac) {
++            filters[0] = ac->f;
++            mp_autoconvert_add_imgfmt(ac, IMGFMT_VIDEOTOOLBOX, 0);
++            if (mp_autoconvert_probe_input_video(ac, img)) {
++                char *args[] = {"mode", "send_field",
++                                "parity", field_parity, NULL};
++                filters[1] = mp_create_user_filter(subf, MP_OUTPUT_CHAIN_VIDEO,
++                                                   "yadif_videotoolbox", args);
++                if (filters[1]) {
++                    mp_chain_filters(subf->ppins[0], subf->ppins[1], filters, 2);
++                    p->sub.filter = subf;
++                    ok = true;
++                    MP_INFO(f, "deinterlace: videotoolbox upload lane active\n");
++                }
++            }
++        }
++        if (!ok)
++            talloc_free(subf);
++    }
++#endif
++
+     if (!p->sub.filter) {
+         if (has_filter)
+             MP_ERR(f, "creating deinterlacer failed\n");
