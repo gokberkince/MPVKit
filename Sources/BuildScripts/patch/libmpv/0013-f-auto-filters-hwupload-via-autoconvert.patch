@@ -1,5 +1,5 @@
 diff --git a/filters/f_auto_filters.c b/filters/f_auto_filters.c
-index 14160aa..a53b0d0 100644
+index 14160aa..8d0ec0c 100644
 --- a/filters/f_auto_filters.c
 +++ b/filters/f_auto_filters.c
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 14160aa..a53b0d0 100644
  #include "audio/aframe.h"
  #include "audio/format.h"
  #include "common/common.h"
-@@ -121,6 +123,42 @@ static void deint_process(struct mp_filter *f)
+@@ -121,6 +123,52 @@ static void deint_process(struct mp_filter *f)
          has_filter = false;
      }
  
@@ -42,8 +42,18 @@ index 14160aa..a53b0d0 100644
 +                    p->sub.filter = subf;
 +                    ok = true;
 +                    MP_INFO(f, "deinterlace: videotoolbox upload lane active\n");
++                } else {
++                    // Every refusal speaks: the first device tape showed only the ABSENCE of
++                    // the active line, which cannot say which gate refused (2026-08-03).
++                    MP_INFO(f, "deinterlace: upload lane skipped: "
++                               "yadif_videotoolbox unavailable\n");
 +                }
++            } else {
++                MP_INFO(f, "deinterlace: upload lane skipped: probe refused %s %dx%d\n",
++                        mp_imgfmt_to_name(img->imgfmt), img->w, img->h);
 +            }
++        } else {
++            MP_INFO(f, "deinterlace: upload lane skipped: autoconvert create failed\n");
 +        }
 +        if (!ok)
 +            talloc_free(subf);

@@ -793,7 +793,20 @@ class BaseBuild {
                 if FileManager.default.fileExists(atPath: tmpChecksum.path) {
                     try? FileManager.default.removeItem(at: tmpChecksum)
                 }
-                try! Utility.launch(path: "wget", arguments: ["-q", "-O", tmpChecksum.path, target.checksum], currentDirectoryURL: FileManager.default.temporaryDirectory)
+                // GitHub intermittently refuses one request in a burst of dozens; a single
+                // failed checksum fetch must not kill a 40-minute build.
+                var checksumFetchError: Error? = nil
+                for attempt in 1...4 {
+                    do {
+                        try Utility.launch(path: "wget", arguments: ["-q", "-O", tmpChecksum.path, target.checksum], currentDirectoryURL: FileManager.default.temporaryDirectory)
+                        checksumFetchError = nil
+                        break
+                    } catch {
+                        checksumFetchError = error
+                        Thread.sleep(forTimeInterval: Double(attempt) * 3)
+                    }
+                }
+                if let checksumFetchError { throw checksumFetchError }
                 let checksum = try String(contentsOf: tmpChecksum, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
                 dependencyTargetContent += """
                 
@@ -971,7 +984,20 @@ class ZipBaseBuild : BaseBuild {
         try! FileManager.default.createDirectory(atPath: directoryURL.path, withIntermediateDirectories: true, attributes: nil)
 
         if !FileManager.default.fileExists(atPath: outputFile.path) {
-            try! Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
+            var downloadError: Error? = nil
+            for attempt in 1...4 {
+                do {
+                    try Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
+                    downloadError = nil
+                    break
+                } catch {
+                    downloadError = error
+                    Thread.sleep(forTimeInterval: Double(attempt) * 3)
+                }
+            }
+            if downloadError != nil {
+                try! Utility.launch(path: "wget", arguments: ["-O", outputFileName, library.url], currentDirectoryURL: directoryURL)
+            }
             try! Utility.launch(path: "/usr/bin/unzip", arguments: ["-o",outputFileName], currentDirectoryURL: directoryURL)
         }
     }

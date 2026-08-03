@@ -1,0 +1,82 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index c13f601..57c065a 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -45,6 +45,9 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+     CMAudioFormatDescriptionRef format_description;
+     AVObserver *observer;
+     int64_t end_time_av;
++    // Set and read only on `queue`: gates the restart handler off during teardown, when
++    // the objects it restarts are being released on the core thread.
++    bool shutting_down;
+ };
+ 
+ static int64_t CMTimeGetNanoseconds(CMTime time)
+@@ -210,8 +213,25 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+     // implementation (osdep/utils-mac.c) is only built on macOS (Cocoa).
+     MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
+     MP_VERBOSE(ao, "notification name: %s\n", notification.name.UTF8String);
+-    stop(ao);
+-    start(ao);
++    // The restart is serialized onto the AO's own queue instead of running on the
++    // notification thread: delivered mid-teardown (the flush and the session deactivation
++    // in uninit both emit these notifications on iOS), a direct stop()/start() here races
++    // the core thread's releases and dies in objc_release. On the queue it is ordered
++    // against uninit's shutting_down flag, which makes the race unrepresentable.
++    struct ao *ao_ = ao;
++    struct priv *p = ao_->priv;
++    dispatch_async(p->queue, ^{
++        if (p->shutting_down)
++            return;
++        [p->renderer stopRequestingMediaData];
++        [p->renderer flush];
++        [p->synchronizer setRate:0];
++        p->end_time_av = -1;
++        [p->synchronizer setRate:1];
++        [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
++            feed(ao_);
++        }];
++    });
+ }
+ @end
+ 
+@@ -336,14 +356,27 @@ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
++    // Teardown emits the very notifications the observer restarts on — the flush below,
++    // the renderer's own dealloc and the iOS session deactivation can all fire a config
++    // change — so the observer is removed FIRST and the flag then stops any restart
++    // already queued. The shipped order (releases first, removeObserver last) let the
++    // handler run stop()/start() against freed objects: an objc_release crash on the
++    // core thread under mp_destroy_client, reported on device after every close.
++    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
++    dispatch_sync(p->queue, ^{
++        p->shutting_down = true;
++    });
++
+     stop(ao);
+ 
++    // Drain the queue once more before releasing: a feed block the renderer enqueued
++    // behind stop()'s own block would otherwise run against a freed renderer. After
++    // stop() ran stopRequestingMediaData on the queue, nothing new can be enqueued.
++    dispatch_sync(p->queue, ^{});
++
+     [p->renderer release];
+     [p->synchronizer release];
+-    dispatch_release(p->queue);
+     CFRelease(p->format_description);
+-
+-    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+     [p->observer release];
+ 
+ #if TARGET_OS_IPHONE
+@@ -352,6 +385,8 @@ static void uninit(struct ao *ao)
+         error:nil
+     ];
+ #endif
++
++    dispatch_release(p->queue);
+ }
+ 
+ #define OPT_BASE_STRUCT struct priv

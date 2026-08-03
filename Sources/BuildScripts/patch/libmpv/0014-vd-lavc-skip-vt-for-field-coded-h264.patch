@@ -1,0 +1,48 @@
+diff --git a/demux/stheader.h b/demux/stheader.h
+index 42046a4..7168b23 100644
+--- a/demux/stheader.h
++++ b/demux/stheader.h
+@@ -118,6 +118,8 @@ struct mp_codec_params {
+     int par_w, par_h;     // pixel aspect ratio (0 if unknown/square)
+     int disp_w, disp_h;   // display size
+     int rotate;           // intended display rotation, in degrees, [0, 359]
++    bool interlaced_hint; // container says field-coded; lets decoders skip hwaccels
++                          // that refuse interlaced streams outright
+     int stereo_mode;      // mp_stereo3d_mode (0 if none/unknown)
+     struct pl_color_space color; // colorspace info where available
+     struct pl_color_repr repr;   // color representation info where available
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..68699d8 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -753,6 +753,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+         }
+         sh->codec->par_w = st->sample_aspect_ratio.num;
+         sh->codec->par_h = st->sample_aspect_ratio.den;
++        sh->codec->interlaced_hint = codec->field_order >= AV_FIELD_TT;
+ 
+         const uint8_t *sd = mp_av_stream_get_side_data(st, AV_PKT_DATA_DISPLAYMATRIX);
+         if (sd) {
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 8b6ab29..f098340 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -575,6 +575,18 @@ static void select_and_set_hwdec(struct mp_filter *vd)
+                                  ctx->num_attempted_hwdecs,
+                                  bstrdup(ctx, bstr0(hwdec->name)));
+ 
++                // VideoToolbox refuses field-coded H.264 outright: every load of an
++                // interlaced broadcast paid a doomed VTDecompressionSession and a
++                // "Failed setup … / no frame!" pair per attempt before falling back to
++                // software. The container already said the stream is field-coded, so
++                // don't audition a decoder that is known to walk out.
++                if (ctx->codec->interlaced_hint && strcmp(codec, "h264") == 0 &&
++                    bstr_startswith0(bstr0(hwdec->name), "videotoolbox"))
++                {
++                    MP_VERBOSE(vd, "Skipping %s: field-coded H.264.\n", hwdec->name);
++                    continue;
++                }
++
+                 if (hwdec_auto_copy && !hwdec->copying) {
+                     MP_VERBOSE(vd, "Not using this for auto-copy.\n");
+                     continue;

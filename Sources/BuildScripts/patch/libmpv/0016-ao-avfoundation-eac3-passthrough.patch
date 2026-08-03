@@ -1,0 +1,273 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 57c065a..72b9b63 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -48,6 +48,15 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+     // Set and read only on `queue`: gates the restart handler off during teardown, when
+     // the objects it restarts are being released on the core thread.
+     bool shutting_down;
++    // E-AC-3 passthrough: the IEC 61937 stream ad_spdif produces is unwrapped back to raw
++    // syncframes and fed as kAudioFormatEnhancedAC3 packets — the renderer decodes them,
++    // Atmos substream included (mpv#11955). `burst_buf` reassembles bursts split across
++    // reads; `eac3_rate` is the real frame rate (the IEC link runs at 4x).
++    bool spdif_eac3;
++    uint8_t *burst_buf;
++    int burst_len;
++    int eac3_rate;
++    int64_t eac3_pts;
+ };
+ 
+ static int64_t CMTimeGetNanoseconds(CMTime time)
+@@ -61,9 +70,127 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+     return CMTimeMake(time, 1000000000);
+ }
+ 
++#define IEC61937_EAC3 21
++#define EAC3_FRAME_SAMPLES 1536
++#define EAC3_BURST_BUF_MAX 65536
++
++// The passthrough lane. ad_spdif hands us IEC 61937 bursts on a 2ch/16bit carrier; each
++// burst holds ONE E-AC-3 syncframe, 16-bit byteswapped. Unwrapped and fed as raw
++// kAudioFormatEnhancedAC3 packets — one syncframe per sample, explicit size, 1536-sample
++// timing — the renderer decodes them natively, Atmos substream included. Verified against
++// this exact packaging on macOS with synthetic 5.1 and real broadcast E-AC-3 before it
++// was written down here.
++static void feed_eac3(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    int samplerate = ao->samplerate; // the IEC link rate; frames play at p->eac3_rate
++    int sstride = ao->sstride;
++
++    int request_sample_count = samplerate / 10;
++    int buffer_size = request_sample_count * sstride;
++    if (p->burst_len + buffer_size > EAC3_BURST_BUF_MAX) {
++        MP_WARN(ao, "eac3: burst reassembly overflow, resyncing\n");
++        p->burst_len = 0;
++    }
++    void *data[] = {p->burst_buf + p->burst_len};
++
++    int64_t cur_time_av = CMTimeGetNanoseconds([p->synchronizer currentTime]);
++    int64_t cur_time_mp = mp_time_ns();
++    int64_t end_time_av = MPMAX(p->end_time_av, cur_time_av);
++    int64_t time_delta = CMTimeGetNanoseconds(CMTimeMake(request_sample_count, samplerate));
++    bool eof;
++    int real_sample_count = ao_read_data(ao, data, request_sample_count,
++        end_time_av - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
++    if (eof) {
++        [p->renderer stopRequestingMediaData];
++        ao_stop_streaming(ao);
++    }
++    p->burst_len += real_sample_count * sstride;
++
++    int64_t frame_ns = CMTimeGetNanoseconds(CMTimeMake(EAC3_FRAME_SAMPLES, p->eac3_rate));
++    int pos = 0;
++    while (pos + 8 <= p->burst_len) {
++        uint8_t *b = p->burst_buf + pos;
++        // Little-endian preambles F872/4E1F; Pc's low 7 bits name the payload type,
++        // and for type 21 Pd counts BYTES.
++        if (!(b[0] == 0x72 && b[1] == 0xF8 && b[2] == 0x1F && b[3] == 0x4E)) {
++            pos += 2;
++            continue;
++        }
++        int type = b[4] | (b[5] << 8);
++        int bytes = b[6] | (b[7] << 8);
++        if ((type & 0x7F) != IEC61937_EAC3 || bytes <= 0) {
++            pos += 2;
++            continue;
++        }
++        if (pos + 8 + bytes > p->burst_len)
++            break; // burst still arriving
++
++        void *frame = CFAllocatorAllocate(NULL, bytes, 0);
++        uint8_t *src = b + 8;
++        uint8_t *dst = frame;
++        for (int i = 0; i + 1 < bytes; i += 2) {
++            dst[i] = src[i + 1];
++            dst[i + 1] = src[i];
++        }
++        if (bytes % 2)
++            dst[bytes - 1] = src[bytes - 1];
++
++        CMBlockBufferRef block = NULL;
++        CMSampleBufferRef sample = NULL;
++        if (CMBlockBufferCreateWithMemoryBlock(NULL, frame, bytes, NULL, NULL, 0,
++                                               bytes, 0, &block) != noErr) {
++            CFAllocatorDeallocate(NULL, frame);
++            MP_ERR(ao, "eac3: failed to create block buffer\n");
++            ao_request_reload(ao);
++            return;
++        }
++        if (p->eac3_pts < 0)
++            p->eac3_pts = MPMAX(cur_time_av, 0);
++        CMSampleTimingInfo timing = {
++            .duration = CMTimeMake(EAC3_FRAME_SAMPLES, p->eac3_rate),
++            .presentationTimeStamp = CMTimeFromNanoseconds(p->eac3_pts),
++            .decodeTimeStamp = kCMTimeInvalid,
++        };
++        size_t frame_size = bytes;
++        if (CMSampleBufferCreateReady(NULL, block, p->format_description, 1, 1, &timing,
++                                      1, &frame_size, &sample) != noErr) {
++            CFRelease(block);
++            MP_ERR(ao, "eac3: failed to create sample buffer\n");
++            ao_request_reload(ao);
++            return;
++        }
++        [p->renderer enqueueSampleBuffer:sample];
++        CFRelease(block);
++        CFRelease(sample);
++        p->eac3_pts += frame_ns;
++        pos += 8 + bytes;
++    }
++    if (pos > 0) {
++        memmove(p->burst_buf, p->burst_buf + pos, p->burst_len - pos);
++        p->burst_len -= pos;
++    }
++
++    time_delta = CMTimeGetNanoseconds(CMTimeMake(real_sample_count, samplerate));
++    p->end_time_av = end_time_av + time_delta;
++
++    if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
++        // The gate: a renderer that refuses the stream reloads the chain once; the app
++        // clears its passthrough option on the audio-init failure that follows, and
++        // playback returns as PCM.
++        MP_ERR(ao, "eac3: renderer failed (%s), requesting reload\n",
++               p->renderer.error.localizedDescription.UTF8String ?: "unknown");
++        ao_request_reload(ao);
++    }
++}
++
+ static void feed(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
++    if (p->spdif_eac3) {
++        feed_eac3(ao);
++        return;
++    }
+     int samplerate = ao->samplerate;
+     int sstride = ao->sstride;
+ 
+@@ -148,6 +275,8 @@ static void start(struct ao *ao)
+     struct priv *p = ao->priv;
+ 
+     p->end_time_av = -1;
++    p->eac3_pts = -1;
++    p->burst_len = 0;
+     [p->synchronizer setRate:1];
+     [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+         feed(ao);
+@@ -227,6 +356,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
+         p->end_time_av = -1;
++        p->eac3_pts = -1;
++        p->burst_len = 0;
+         [p->synchronizer setRate:1];
+         [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+             feed(ao_);
+@@ -284,45 +415,70 @@ static int init(struct ao *ao)
+ #endif
+ 
+     if (af_fmt_is_spdif(ao->format)) {
+-        MP_FATAL(ao, "avfoundation does not support SPDIF\n");
++        if (ao->format != AF_FORMAT_S_EAC3) {
++            MP_FATAL(ao, "avfoundation only passes E-AC-3 through\n");
+ #if HAVE_COREAUDIO
+-        MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
++            MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
+ #endif
+-        goto error;
+-    }
+-
+-    // AVSampleBufferAudioRenderer only supports interleaved formats
+-    ao->format = af_fmt_from_planar(ao->format);
+-    if (af_fmt_is_planar(ao->format)) {
+-        MP_FATAL(ao, "planar audio formats are unsupported\n");
+-        goto error;
+-    }
+-
+-    AudioStreamBasicDescription asbd;
+-    ca_fill_asbd(ao, &asbd);
+-    size_t layout_size;
+-    layout = ca_get_acl(ao, &layout_size);
+-
+-    OSStatus err;
+-    if ((err = CMAudioFormatDescriptionCreate(
+-        NULL,
+-        &asbd,
+-        layout_size,
+-        layout,
+-        0,
+-        NULL,
+-        NULL,
+-        &p->format_description
+-    )) != noErr) {
+-        MP_FATAL(ao, "failed to create audio format description\n");
+-        MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", err);
+-        goto error;
++            goto error;
++        }
++        p->spdif_eac3 = true;
++        // ad_spdif reports the 4x IEC link rate for E-AC-3; the frames play at the
++        // real rate.
++        p->eac3_rate = ao->samplerate >= 176400 ? ao->samplerate / 4 : ao->samplerate;
++        p->eac3_pts = -1;
++        p->burst_buf = talloc_size(p, EAC3_BURST_BUF_MAX);
++
++        AudioStreamBasicDescription asbd = {
++            .mSampleRate = p->eac3_rate,
++            .mFormatID = kAudioFormatEnhancedAC3,
++            .mFramesPerPacket = EAC3_FRAME_SAMPLES,
++            .mChannelsPerFrame = 6,
++        };
++        OSStatus err;
++        if ((err = CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL, NULL,
++                                                  &p->format_description)) != noErr) {
++            MP_FATAL(ao, "failed to create E-AC-3 format description\n");
++            MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", (int)err);
++            goto error;
++        }
++        // Half a second of link samples of readahead: compressed frames are cheap and
++        // the renderer's own appetite covers the rest.
++        ao->device_buffer = ao->samplerate / 2;
++    } else {
++        // AVSampleBufferAudioRenderer only supports interleaved formats
++        ao->format = af_fmt_from_planar(ao->format);
++        if (af_fmt_is_planar(ao->format)) {
++            MP_FATAL(ao, "planar audio formats are unsupported\n");
++            goto error;
++        }
++
++        AudioStreamBasicDescription asbd;
++        ca_fill_asbd(ao, &asbd);
++        size_t layout_size;
++        layout = ca_get_acl(ao, &layout_size);
++
++        OSStatus err;
++        if ((err = CMAudioFormatDescriptionCreate(
++            NULL,
++            &asbd,
++            layout_size,
++            layout,
++            0,
++            NULL,
++            NULL,
++            &p->format_description
++        )) != noErr) {
++            MP_FATAL(ao, "failed to create audio format description\n");
++            MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", err);
++            goto error;
++        }
++        talloc_free(layout);
++        layout = NULL;
++
++        // AVSampleBufferAudioRenderer read ahead aggressively
++        ao->device_buffer = ao->samplerate * 2;
+     }
+-    talloc_free(layout);
+-    layout = NULL;
+-
+-    // AVSampleBufferAudioRenderer read ahead aggressively
+-    ao->device_buffer = ao->samplerate * 2;
+ 
+     p->observer = [[AVObserver alloc] initWithAO:ao];
+     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
