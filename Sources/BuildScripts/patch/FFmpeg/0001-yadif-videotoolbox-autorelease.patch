@@ -1,0 +1,35 @@
+diff --git a/libavfilter/vf_yadif_videotoolbox.m b/libavfilter/vf_yadif_videotoolbox.m
+index f8eb0c6..17f0d7c 100644
+--- a/libavfilter/vf_yadif_videotoolbox.m
++++ b/libavfilter/vf_yadif_videotoolbox.m
+@@ -96,13 +96,20 @@ static void call_kernel(AVFilterContext *ctx,
+     [buffer commit];
+     [buffer waitUntilCompleted];
+ 
+-    ff_objc_release(&encoder);
+-    ff_objc_release(&buffer);
++    // `commandBuffer` and `computeCommandEncoder` follow Cocoa naming: both return
++    // AUTORELEASED objects. Releasing them here as well left two dangling entries in the
++    // calling thread's autorelease pool, detonating whenever that pool finally popped —
++    // for a libmpv host, at the core thread's exit under mpv_terminate_destroy.
+ }
+ 
+ static void filter(AVFilterContext *ctx, AVFrame *dst,
+                    int parity, int tff) API_AVAILABLE(macos(10.11), ios(8.0))
+ {
++    // One pool per filtered frame: the textures CVMetalTextureGetTexture hands out and the
++    // command buffer/encoder above are all autoreleased, and the thread running a filter
++    // graph (libmpv's core thread) owns no pool of its own — without this, every deint
++    // frame grew that thread's pool until thread exit.
++    @autoreleasepool {
+     YADIFVTContext *s = ctx->priv;
+     YADIFContext *y = &s->yadif;
+     int i;
+@@ -168,6 +175,7 @@ static void filter(AVFilterContext *ctx, AVFrame *dst,
+ 
+ exit:
+     return;
++    }
+ }
+ 
+ static av_cold void do_uninit(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))

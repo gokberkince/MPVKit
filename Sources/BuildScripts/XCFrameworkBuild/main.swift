@@ -676,6 +676,9 @@ private class BuildFFMPEG: BaseBuild {
         "--enable-muxer=flac", "--enable-muxer=dash", "--enable-muxer=hevc",
         "--enable-muxer=m4v", "--enable-muxer=matroska", "--enable-muxer=mov", "--enable-muxer=mp4",
         "--enable-muxer=mpegts", "--enable-muxer=webm*",
+        // ad_spdif builds its IEC 61937 stream through libavformat's spdif muxer; without
+        // this the E-AC-3 passthrough lane dies silently at av_guess_format("spdif").
+        "--enable-muxer=spdif",
         // ./configure --list-encoders
         "--disable-encoders",
         "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",

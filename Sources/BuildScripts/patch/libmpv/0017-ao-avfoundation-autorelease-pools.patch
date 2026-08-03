@@ -1,0 +1,94 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 72b9b63..aa88b8d 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -270,8 +270,13 @@ static void feed(struct ao *ao)
+     if (sample_buffer) CFRelease(sample_buffer);
+ }
+ 
++// Every entry point mpv calls on its own threads wears a pool: those threads never pop
++// an autorelease pool of their own, so anything AVFoundation autoreleases in here would
++// otherwise sit in the thread-exit pool — a leak all session and a use-after-free bomb
++// at mpv_terminate_destroy (the yadif_videotoolbox lesson, 2026-08-03).
+ static void start(struct ao *ao)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+ 
+     p->end_time_av = -1;
+@@ -281,10 +286,12 @@ static void start(struct ao *ao)
+     [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+         feed(ao);
+     }];
++    }
+ }
+ 
+ static void stop(struct ao *ao)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+ 
+     dispatch_sync(p->queue, ^{
+@@ -292,10 +299,12 @@ static void stop(struct ao *ao)
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
+     });
++    }
+ }
+ 
+ static bool set_pause(struct ao *ao, bool paused)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+ 
+     if (paused) {
+@@ -305,10 +314,12 @@ static bool set_pause(struct ao *ao, bool paused)
+     }
+ 
+     return true;
++    }
+ }
+ 
+ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+ 
+     switch (cmd) {
+@@ -327,6 +338,7 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+     default:
+         return CONTROL_UNKNOWN;
+     }
++    }
+ }
+ 
+ @implementation AVObserver
+@@ -368,6 +380,7 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+ 
+ static int init(struct ao *ao)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+     AudioChannelLayout *layout = NULL;
+ 
+@@ -506,10 +519,12 @@ static int init(struct ao *ao)
+ #endif
+ 
+     return CONTROL_ERROR;
++    }
+ }
+ 
+ static void uninit(struct ao *ao)
+ {
++    @autoreleasepool {
+     struct priv *p = ao->priv;
+ 
+     // Teardown emits the very notifications the observer restarts on — the flush below,
+@@ -543,6 +558,7 @@ static void uninit(struct ao *ao)
+ #endif
+ 
+     dispatch_release(p->queue);
++    }
+ }
+ 
+ #define OPT_BASE_STRUCT struct priv
