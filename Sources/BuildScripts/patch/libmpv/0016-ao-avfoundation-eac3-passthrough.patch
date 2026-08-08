@@ -1,8 +1,16 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 57c065a..8578a77 100644
+index 57c065a..274b7ec 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
-@@ -48,6 +48,15 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+@@ -26,6 +26,7 @@
+ #include "ta/ta_talloc.h"
+
+ #import <AVFoundation/AVFoundation.h>
++#import <AudioToolbox/AudioToolbox.h>
+ #import <Foundation/Foundation.h>
+ #import <CoreAudioTypes/CoreAudioTypes.h>
+ #import <CoreFoundation/CoreFoundation.h>
+@@ -48,6 +49,16 @@ - (void)handleRestartNotification:(NSNotification*)notification;
      // Set and read only on `queue`: gates the restart handler off during teardown, when
      // the objects it restarts are being released on the core thread.
      bool shutting_down;
@@ -11,29 +19,148 @@ index 57c065a..8578a77 100644
 +    // Atmos substream included (mpv#11955). `burst_buf` reassembles bursts split across
 +    // reads; `eac3_rate` is the real frame rate (the IEC link runs at 4x).
 +    bool spdif_eac3;
++    bool eac3_description_probed;
 +    uint8_t *burst_buf;
 +    int burst_len;
 +    int eac3_rate;
 +    int64_t eac3_pts;
  };
- 
+
  static int64_t CMTimeGetNanoseconds(CMTime time)
-@@ -61,9 +70,135 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+@@ -61,9 +72,256 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
      return CMTimeMake(time, 1000000000);
  }
- 
+
 +#define IEC61937_EAC3 21
 +#define EAC3_FRAME_SAMPLES 1536
 +// The IEC link runs at 4x, so one 100 ms read is 192000/10 * 4 B = 76.8 KiB; the buffer
 +// holds two reads plus a carried burst with room to spare.
 +#define EAC3_BURST_BUF_MAX 262144
 +
++struct eac3_memory_file {
++    const uint8_t *data;
++    UInt32 size;
++};
++
++static OSStatus eac3_read_memory(void *opaque, SInt64 position, UInt32 request,
++                                 void *buffer, UInt32 *actual)
++{
++    struct eac3_memory_file *source = opaque;
++    if (position < 0 || position >= source->size) {
++        *actual = 0;
++        return noErr;
++    }
++
++    UInt32 available = source->size - (UInt32)position;
++    *actual = MPMIN(request, available);
++    memcpy(buffer, source->data + position, *actual);
++    return noErr;
++}
++
++static SInt64 eac3_memory_size(void *opaque)
++{
++    return ((struct eac3_memory_file *)opaque)->size;
++}
++
++// A bare ec-3 ASBD describes only the compatible 5.1 bed. Apple's AudioFile parser derives
++// the dec3 magic cookie and base channel layout from the compressed syncframe; CoreMedia then
++// reconstructs the richer ec+3/JOC format list from those two pieces. No decode or re-encode
++// happens here: the source packet itself remains byte-identical.
++static void probe_eac3_description(struct ao *ao, const uint8_t *data, UInt32 size)
++{
++    struct priv *p = ao->priv;
++    p->eac3_description_probed = true;
++
++    struct eac3_memory_file source = {data, size};
++    AudioFileID file = NULL;
++    void *cookie = NULL;
++    AudioChannelLayout *layout = NULL;
++    CMAudioFormatDescriptionRef description = NULL;
++
++    OSStatus err = AudioFileOpenWithCallbacks(&source, eac3_read_memory, NULL,
++        eac3_memory_size, NULL, kAudioFileAC3Type, &file);
++    if (err != noErr) {
++        MP_WARN(ao, "eac3: Apple parser rejected the first access unit (%d); "
++                "using the compatible base description\n", (int)err);
++        goto done;
++    }
++
++    AudioStreamBasicDescription asbd = {0};
++    UInt32 asbd_size = sizeof(asbd);
++    if ((err = AudioFileGetProperty(file, kAudioFilePropertyDataFormat,
++                                    &asbd_size, &asbd)) != noErr)
++        goto property_error;
++
++    UInt32 cookie_size = 0;
++    if ((err = AudioFileGetPropertyInfo(file, kAudioFilePropertyMagicCookieData,
++                                        &cookie_size, NULL)) != noErr || !cookie_size)
++        goto property_error;
++    cookie = talloc_size(NULL, cookie_size);
++    if (!cookie)
++        goto done;
++    if ((err = AudioFileGetProperty(file, kAudioFilePropertyMagicCookieData,
++                                    &cookie_size, cookie)) != noErr)
++        goto property_error;
++
++    UInt32 layout_size = 0;
++    if ((err = AudioFileGetPropertyInfo(file, kAudioFilePropertyChannelLayout,
++                                        &layout_size, NULL)) != noErr || !layout_size)
++        goto property_error;
++    layout = talloc_size(NULL, layout_size);
++    if (!layout)
++        goto done;
++    if ((err = AudioFileGetProperty(file, kAudioFilePropertyChannelLayout,
++                                    &layout_size, layout)) != noErr)
++        goto property_error;
++
++    // ad_spdif may aggregate several short E-AC-3 syncframes into one 1536-sample IEC burst.
++    // That whole access unit is one sample at this AO boundary, irrespective of the first raw
++    // syncframe's numblkscod value reported by AudioFile.
++    asbd.mSampleRate = p->eac3_rate;
++    asbd.mFramesPerPacket = EAC3_FRAME_SAMPLES;
++    if ((err = CMAudioFormatDescriptionCreate(NULL, &asbd, layout_size, layout,
++            cookie_size, cookie, NULL, &description)) != noErr) {
++        MP_WARN(ao, "eac3: failed to create signalled format description (%d); "
++                "using the compatible base description\n", (int)err);
++        goto done;
++    }
++
++    bool has_joc = false;
++    size_t format_list_size = 0;
++    const AudioFormatListItem *format_list =
++        CMAudioFormatDescriptionGetFormatList(description, &format_list_size);
++    for (size_t n = 0; n < format_list_size / sizeof(*format_list); n++) {
++        if (format_list[n].mASBD.mFormatID == 'ec+3') {
++            has_joc = true;
++            break;
++        }
++    }
++
++    CFRelease(p->format_description);
++    p->format_description = description;
++    description = NULL;
++    MP_INFO(ao, "eac3: Apple format signalling ready (cookie=%u, JOC=%s)\n",
++            cookie_size, has_joc ? "yes" : "no");
++    goto done;
++
++property_error:
++    MP_WARN(ao, "eac3: incomplete Apple format metadata (%d); "
++            "using the compatible base description\n", (int)err);
++done:
++    if (description)
++        CFRelease(description);
++    if (file)
++        AudioFileClose(file);
++    talloc_free(layout);
++    talloc_free(cookie);
++}
++
 +// The passthrough lane. ad_spdif hands us IEC 61937 bursts on a 2ch/16bit carrier; each
-+// burst holds ONE E-AC-3 syncframe, 16-bit byteswapped. Unwrapped and fed as raw
-+// kAudioFormatEnhancedAC3 packets — one syncframe per sample, explicit size, 1536-sample
-+// timing — the renderer decodes them natively, Atmos substream included. Verified against
-+// this exact packaging on macOS with synthetic 5.1 and real broadcast E-AC-3 before it
-+// was written down here.
++// burst holds one 1536-sample E-AC-3 access unit (one or more syncframes), 16-bit
++// byteswapped. Unwrapped and fed as raw kAudioFormatEnhancedAC3 packets — one access unit
++// per sample and explicit 1536-sample timing. The renderer receives the native compressed
++// payload plus Apple's derived JOC signalling; tvOS and the attached route decide the final
++// Dolby MAT/PCM output.
 +static void feed_eac3(struct ao *ao)
 +{
 +    struct priv *p = ao->priv;
@@ -96,6 +223,9 @@ index 57c065a..8578a77 100644
 +        if (bytes % 2)
 +            dst[bytes - 1] = src[bytes - 1];
 +
++        if (!p->eac3_description_probed)
++            probe_eac3_description(ao, frame, bytes);
++
 +        CMBlockBufferRef block = NULL;
 +        CMSampleBufferRef sample = NULL;
 +        if (CMBlockBufferCreateWithMemoryBlock(NULL, frame, bytes, NULL, NULL, 0,
@@ -153,17 +283,17 @@ index 57c065a..8578a77 100644
 +    }
      int samplerate = ao->samplerate;
      int sstride = ao->sstride;
- 
-@@ -148,6 +283,8 @@ static void start(struct ao *ao)
+
+@@ -148,6 +406,8 @@ static void start(struct ao *ao)
      struct priv *p = ao->priv;
- 
+
      p->end_time_av = -1;
 +    p->eac3_pts = -1;
 +    p->burst_len = 0;
      [p->synchronizer setRate:1];
      [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
          feed(ao);
-@@ -227,6 +364,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+@@ -227,6 +487,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
          [p->renderer flush];
          [p->synchronizer setRate:0];
          p->end_time_av = -1;
@@ -172,9 +302,29 @@ index 57c065a..8578a77 100644
          [p->synchronizer setRate:1];
          [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
              feed(ao_);
-@@ -284,45 +423,70 @@ static int init(struct ao *ao)
+@@ -242,11 +504,16 @@ static int init(struct ao *ao)
+
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+-    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
+-    NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
+     [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+     [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
+     [instance setActive:YES error:nil];
+-    [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    // E-AC-3's IEC carrier is always reported to mpv as stereo, but neither that value nor
++    // the route maximum describes the JOC object render. Let AVSampleBufferAudioRenderer
++    // negotiate compressed content; only request a physical channel count for PCM.
++    if (!af_fmt_is_spdif(ao->format)) {
++        NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
++        NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
++        [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    }
  #endif
- 
+
+@@ -284,45 +549,70 @@ static int init(struct ao *ao)
+ #endif
+
      if (af_fmt_is_spdif(ao->format)) {
 -        MP_FATAL(ao, "avfoundation does not support SPDIF\n");
 +        if (ao->format != AF_FORMAT_S_EAC3) {
@@ -276,6 +426,19 @@ index 57c065a..8578a77 100644
 -
 -    // AVSampleBufferAudioRenderer read ahead aggressively
 -    ao->device_buffer = ao->samplerate * 2;
- 
+
      p->observer = [[AVObserver alloc] initWithAO:ao];
      NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+diff --git a/meson.build b/meson.build
+index 42ece8e..21631c8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -815,7 +815,7 @@ if features['audiounit']
+     sources += files('audio/out/ao_audiounit.m')
+ endif
+
+-avfoundation = dependency('appleframeworks', modules: ['CoreMedia', 'AVFoundation'],
++avfoundation = dependency('appleframeworks', modules: ['CoreMedia', 'AVFoundation', 'AudioToolbox'],
+                           required: get_option('avfoundation'))
+ features += {'avfoundation': avfoundation.found()}
+ if features['avfoundation']
