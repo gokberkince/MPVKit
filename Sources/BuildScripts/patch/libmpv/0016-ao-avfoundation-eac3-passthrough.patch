@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 57c065a..274b7ec 100644
+index 57c065a..3697f50 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -26,6 +26,7 @@
@@ -10,7 +10,7 @@ index 57c065a..274b7ec 100644
  #import <Foundation/Foundation.h>
  #import <CoreAudioTypes/CoreAudioTypes.h>
  #import <CoreFoundation/CoreFoundation.h>
-@@ -48,6 +49,16 @@ - (void)handleRestartNotification:(NSNotification*)notification;
+@@ -48,6 +49,17 @@ - (void)handleRestartNotification:(NSNotification*)notification;
      // Set and read only on `queue`: gates the restart handler off during teardown, when
      // the objects it restarts are being released on the core thread.
      bool shutting_down;
@@ -20,6 +20,7 @@ index 57c065a..274b7ec 100644
 +    // reads; `eac3_rate` is the real frame rate (the IEC link runs at 4x).
 +    bool spdif_eac3;
 +    bool eac3_description_probed;
++    CMAudioFormatDescriptionRef eac3_base_description;
 +    uint8_t *burst_buf;
 +    int burst_len;
 +    int eac3_rate;
@@ -27,7 +28,7 @@ index 57c065a..274b7ec 100644
  };
 
  static int64_t CMTimeGetNanoseconds(CMTime time)
-@@ -61,9 +72,256 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+@@ -61,9 +73,256 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
      return CMTimeMake(time, 1000000000);
  }
 
@@ -284,16 +285,30 @@ index 57c065a..274b7ec 100644
      int samplerate = ao->samplerate;
      int sstride = ao->sstride;
 
-@@ -148,6 +406,8 @@ static void start(struct ao *ao)
+@@ -147,7 +406,21 @@ static void start(struct ao *ao)
+ {
      struct priv *p = ao->priv;
 
-     p->end_time_av = -1;
-+    p->eac3_pts = -1;
-+    p->burst_len = 0;
+-    p->end_time_av = -1;
++    // feed/probe and notification-driven restarts also live on this queue. Reset there so a
++    // track switch cannot release its format description under a concurrent sample build.
++    dispatch_sync(p->queue, ^{
++        p->end_time_av = -1;
++        p->eac3_pts = -1;
++        p->burst_len = 0;
++        if (p->spdif_eac3) {
++            // gapless-audio may keep this AO across an E-AC-3 track switch. Never let the
++            // previous track's dec3/JOC metadata describe the next track's packets.
++            p->eac3_description_probed = false;
++            CFRelease(p->format_description);
++            p->format_description =
++                (CMAudioFormatDescriptionRef)CFRetain(p->eac3_base_description);
++        }
++    });
      [p->synchronizer setRate:1];
      [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
          feed(ao);
-@@ -227,6 +487,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+@@ -227,6 +500,8 @@ - (void)handleRestartNotification:(NSNotification*)notification {
          [p->renderer flush];
          [p->synchronizer setRate:0];
          p->end_time_av = -1;
@@ -302,7 +317,7 @@ index 57c065a..274b7ec 100644
          [p->synchronizer setRate:1];
          [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
              feed(ao_);
-@@ -242,11 +504,16 @@ static int init(struct ao *ao)
+@@ -242,12 +517,17 @@ static int init(struct ao *ao)
 
  #if TARGET_OS_IPHONE
      AVAudioSession *instance = AVAudioSession.sharedInstance;
@@ -322,7 +337,8 @@ index 57c065a..274b7ec 100644
 +    }
  #endif
 
-@@ -284,45 +549,70 @@ static int init(struct ao *ao)
+     if ((p->renderer = [[AVSampleBufferAudioRenderer alloc] init]) == nil) {
+@@ -284,45 +564,72 @@ static int init(struct ao *ao)
  #endif
 
      if (af_fmt_is_spdif(ao->format)) {
@@ -379,11 +395,13 @@ index 57c065a..274b7ec 100644
 +        };
 +        OSStatus err;
 +        if ((err = CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL, NULL,
-+                                                  &p->format_description)) != noErr) {
++                                                  &p->eac3_base_description)) != noErr) {
 +            MP_FATAL(ao, "failed to create E-AC-3 format description\n");
 +            MP_VERBOSE(ao, "CMAudioFormatDescriptionCreate returned %d\n", (int)err);
 +            goto error;
 +        }
++        p->format_description =
++            (CMAudioFormatDescriptionRef)CFRetain(p->eac3_base_description);
 +        // Half a second of link samples of readahead: compressed frames are cheap and
 +        // the renderer's own appetite covers the rest.
 +        ao->device_buffer = ao->samplerate / 2;
@@ -429,6 +447,22 @@ index 57c065a..274b7ec 100644
 
      p->observer = [[AVObserver alloc] initWithAO:ao];
      NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+@@ -341,6 +648,7 @@ static int init(struct ao *ao)
+     if (p->synchronizer) [p->synchronizer release];
+     if (p->queue) dispatch_release(p->queue);
+     if (p->format_description) CFRelease(p->format_description);
++    if (p->eac3_base_description) CFRelease(p->eac3_base_description);
+
+ #if TARGET_OS_IPHONE
+     [AVAudioSession.sharedInstance setActive:NO
+@@ -377,6 +685,7 @@ static void uninit(struct ao *ao)
+     [p->renderer release];
+     [p->synchronizer release];
+     CFRelease(p->format_description);
++    if (p->eac3_base_description) CFRelease(p->eac3_base_description);
+     [p->observer release];
+
+ #if TARGET_OS_IPHONE
 diff --git a/meson.build b/meson.build
 index 42ece8e..21631c8 100644
 --- a/meson.build
