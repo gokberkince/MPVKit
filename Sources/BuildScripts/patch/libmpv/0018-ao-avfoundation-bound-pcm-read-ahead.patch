@@ -1,0 +1,16 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -640,8 +640,10 @@ static int init(struct ao *ao)
+         talloc_free(layout);
+         layout = NULL;
+ 
+-        // AVSampleBufferAudioRenderer read ahead aggressively
+-        ao->device_buffer = ao->samplerate * 2;
++        // Keep queued PCM short enough that a demuxer reconnect cannot let the audio
++        // clock run seconds ahead of a buffering video. AVFoundation still receives
++        // half a second, matching the compressed E-AC-3 lane above.
++        ao->device_buffer = ao->samplerate / 2;
+     }
+ 
+     p->observer = [[AVObserver alloc] initWithAO:ao];
