@@ -1,0 +1,14 @@
+diff --git a/audio/out/ao_audiounit.m b/audio/out/ao_audiounit.m
+--- a/audio/out/ao_audiounit.m
++++ b/audio/out/ao_audiounit.m
+@@ -214,6 +214,10 @@ static void stop(struct ao *ao)
+     struct priv *p = ao->priv;
+     OSStatus err = AudioOutputUnitStop(p->audio_unit);
+     CHECK_CA_WARN("can't stop audio unit");
++
++    // Stop render callbacks and discard samples already queued by the output unit.
++    err = AudioUnitReset(p->audio_unit, kAudioUnitScope_Global, 0);
++    CHECK_CA_WARN("can't reset audio unit");
+ }
+
+ static void start(struct ao *ao)
