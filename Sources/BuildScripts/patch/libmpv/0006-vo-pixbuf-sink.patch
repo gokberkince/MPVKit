@@ -1,0 +1,137 @@
+--- a/options/options.h
++++ b/options/options.h
+@@ -69,6 +69,7 @@
+     bool show_in_taskbar;
+ 
+     int64_t WinID;
++    int64_t pixbuf_sink;
+ 
+     float force_monitor_aspect;
+     float monitor_pixel_aspect;
+--- a/options/options.c
++++ b/options/options.c
+@@ -171,6 +171,7 @@
+         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
+     {"video-recenter", OPT_BOOL(recenter)},
+     {"wid", OPT_INT64(WinID), .flags = UPDATE_VO},
++    {"vo-pixbuf-sink", OPT_INT64(pixbuf_sink)},
+     {"screen", OPT_CHOICE(screen_id, {"default", -1}), M_RANGE(0, 32)},
+     {"screen-name", OPT_STRING(screen_name)},
+     {"fs-screen", OPT_CHOICE(fsscreen_id, {"all", -2}, {"current", -1}),
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -33,6 +33,21 @@
+ #include "options/options.h"
+ #include "misc/bstr.h"
+ #include "vo.h"
++
++#ifdef __APPLE__
++#include <CoreVideo/CoreVideo.h>
++
++// Fork addition (Lumen): hands every displayed frame to the embedding app, which feeds
++// AVSampleBufferDisplayLayer for system Picture in Picture. Upstream has no AVFoundation vo,
++// and the client API exposes no decoded frames. The struct layout is ABI between this fork and
++// the app; the pointer passed via --vo-pixbuf-sink must outlive the vo, and the callback
++// receives the pixel buffer retained — releasing it is the callee's job. Called on the vo
++// thread; the callee must not block.
++struct mp_pixbuf_sink {
++    void (*frame)(void *ctx, void *cv_pixbuf, double pts_seconds);
++    void *ctx;
++};
++#endif
+ #include "aspect.h"
+ #include "dr_helper.h"
+ #include "input/input.h"
+@@ -120,6 +135,7 @@
+ };
+ 
+ struct vo_internal {
++    void *last_tapped_pixbuf;
+     mp_thread thread;
+     struct mp_dispatch_queue *dispatch;
+     struct dr_helper *dr_helper;
+@@ -911,7 +927,72 @@
+             break;
+     }
+     mp_mutex_unlock(&in->lock);
++}
++
++#ifdef __APPLE__
++// Software frames wrapped for the sink: interlaced broadcast H.264 never hardware-decodes on
++// iOS — VideoToolbox does not accept field-coded streams — so live TV arrives as plain yuv420
++// and PiP would starve without this. IOSurface-backed NV12 so the display layer shows it
++// without a further conversion; one packed copy per frame is the price.
++static void *tap_wrap_sw_frame(struct mp_image *img)
++{
++    if (img->imgfmt != IMGFMT_420P || img->num_planes < 3)
++        return NULL;
++    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 1,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionaryRef surf = CFDictionaryCreate(NULL, NULL, NULL, 0,
++        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surf);
++    CFRelease(surf);
++    CVPixelBufferRef pb = NULL;
++    CVReturn err = CVPixelBufferCreate(NULL, img->w, img->h,
++        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pb);
++    CFRelease(attrs);
++    if (err != kCVReturnSuccess || !pb)
++        return NULL;
++    CVPixelBufferLockBaseAddress(pb, 0);
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
++    size_t pitch_y = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
++    for (int y = 0; y < img->h; y++)
++        memcpy(dst_y + (size_t)y * pitch_y,
++               img->planes[0] + (ptrdiff_t)y * img->stride[0], img->w);
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
++    size_t pitch_uv = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
++    int ch = (img->h + 1) / 2, cw = (img->w + 1) / 2;
++    for (int y = 0; y < ch; y++) {
++        const uint8_t *u = img->planes[1] + (ptrdiff_t)y * img->stride[1];
++        const uint8_t *v = img->planes[2] + (ptrdiff_t)y * img->stride[2];
++        uint8_t *row = dst_uv + (size_t)y * pitch_uv;
++        for (int x = 0; x < cw; x++) {
++            row[2 * x] = u[x];
++            row[2 * x + 1] = v[x];
++        }
++    }
++    CVPixelBufferUnlockBaseAddress(pb, 0);
++    return pb;
++}
++
++static void tap_pixbuf(struct vo *vo, struct vo_frame *frame)
++{
++    struct mp_pixbuf_sink *sink = (void *)(intptr_t)vo->opts->pixbuf_sink;
++    if (!sink || !sink->frame || !frame || !frame->current)
++        return;
++    struct mp_image *img = frame->current;
++    if (img == vo->in->last_tapped_pixbuf)
++        return;
++    vo->in->last_tapped_pixbuf = img;
++    void *pixbuf = NULL;
++    if (img->imgfmt == IMGFMT_VIDEOTOOLBOX && img->planes[3]) {
++        pixbuf = img->planes[3];
++        CVPixelBufferRetain((CVPixelBufferRef)pixbuf);
++    } else {
++        pixbuf = tap_wrap_sw_frame(img);
++    }
++    if (!pixbuf)
++        return;
++    sink->frame(sink->ctx, pixbuf, frame->pts / 1e9);
+ }
++#endif
+ 
+ static bool render_frame(struct vo *vo)
+ {
+@@ -1006,6 +1087,11 @@
+ 
+         stats_time_start(in->stats, "video-draw");
+ 
++#ifdef __APPLE__
++        // Before the draw: the tap mirrors the DECODED frame, and drawing can stall on a
++        // background CAMetalLayer's drawable while PiP is exactly the consumer that must not.
++        tap_pixbuf(vo, frame);
++#endif
+         in->visible = vo->driver->draw_frame(vo, frame);
+ 
+         stats_time_end(in->stats, "video-draw");
