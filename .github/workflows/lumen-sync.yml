@@ -1,0 +1,48 @@
+name: Lumen sync from upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild main as upstream + lumen overlay
+        run: |
+          set -euo pipefail
+          git config user.name "lumen-sync"
+          git config user.email "noreply@lumen"
+          git remote add upstream https://github.com/mpvkit/MPVKit.git
+          git fetch upstream main
+          # The overlay is everything the fork adds; it rides on top of a fresh upstream main.
+          mkdir -p /tmp/overlay
+          cp -R Sources/BuildScripts/patch /tmp/overlay/patch
+          cp -R lumen /tmp/overlay/lumen
+          cp .github/workflows/lumen-sync.yml /tmp/overlay/lumen-sync.yml
+          cp .github/workflows/ci.yml /tmp/overlay/ci.yml
+          # build.yml too: upstream's copy builds every platform, and the visionOS slice cannot
+          # configure here. Leaving it out of the overlay is how the platform limit gets reverted
+          # by the next sync and the next release fails the same way.
+          cp .github/workflows/build.yml /tmp/overlay/build.yml
+          git reset --hard upstream/main
+          mkdir -p Sources/BuildScripts
+          rm -rf Sources/BuildScripts/patch
+          cp -R /tmp/overlay/patch Sources/BuildScripts/patch
+          rm -rf lumen && cp -R /tmp/overlay/lumen lumen
+          mkdir -p .github/workflows
+          cp /tmp/overlay/lumen-sync.yml .github/workflows/lumen-sync.yml
+          cp /tmp/overlay/ci.yml .github/workflows/ci.yml
+          cp /tmp/overlay/build.yml .github/workflows/build.yml
+          python3 lumen/retarget.py
+          git add -A
+          git commit -m "sync: upstream $(git rev-parse --short upstream/main) + lumen overlay"
+          git push --force-with-lease origin HEAD:main
