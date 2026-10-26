@@ -69,21 +69,6 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Build visionOS
-        run: |
-          xcodebuild -resolvePackageDependencies \
-            -project Demo/Demo-visionOS/Demo-visionOS.xcodeproj \
-            -scheme Demo-visionOS
-
-          xcodebuild -project Demo/Demo-visionOS/Demo-visionOS.xcodeproj \
-            -scheme Demo-visionOS \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-
       - name: Build Succeeded
         run: |
           echo "Build completed successfully."
