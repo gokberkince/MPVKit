@@ -7,11 +7,22 @@ on:
         description: 'Release tag name (default mpv version)'
         default: ''
 
+env:
+  # The slices this fork actually ships. visionOS is NOT one of them: nothing consumes it, and
+  # FFmpeg's configure cannot even get through it here — libplacebo's pkg-config needs a vulkan
+  # module that is not built for xros, so `make build` dies before mpv is reached. Without this the
+  # GPL step fails first and takes the LGPL build and the release upload down with it, skipped.
+  # ci.yml was taught the same lesson in 5bc6710; this workflow was left behind.
+  LUMEN_PLATFORMS: ios,isimulator,macos,tvos,tvsimulator
+
 jobs:
   build:
     permissions:
       contents: write
-    runs-on: macos-14
+    # The image ci.yml already uses, and the one that matches how these releases have actually been
+    # produced: every shipped tag so far was built locally on Xcode 27 / iPhoneOS 27 SDK, never by
+    # this workflow — it had never been run before 2026-07-30.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -63,14 +74,20 @@ jobs:
           brew install ninja
           brew install rename
 
-      - name: Setup Xcode to support visionOS
+      # The step this replaces pinned Xcode 15.4 — solely to get a visionOS SDK, which nothing here
+      # builds any more. Its iPhoneOS 17.5 SDK is what made libplacebo's configure link test fail
+      # with "symbol(s) not found for architecture arm64", so the pin was not merely redundant, it
+      # was the second thing standing between this workflow and a release. The toolchain is printed
+      # rather than chosen: the next SDK-shaped failure should be readable straight from the log.
+      - name: Show toolchain
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
           xcodebuild -showsdks
 
       - name: Build GPL version
         run: |
-          make build enable-gpl version=${{ env.RELEASE_VERSION }}
+          make build enable-gpl version=${{ env.RELEASE_VERSION }} platform=${{ env.LUMEN_PLATFORMS }}
 
           cd ./dist/release
           rename 's/-all\.zip/-GPL-all\.zip/' *-all.zip
@@ -92,7 +109,7 @@ jobs:
       
       - name: Build LGPL version
         run: |
-          make build version=${{ env.RELEASE_VERSION }}
+          make build version=${{ env.RELEASE_VERSION }} platform=${{ env.LUMEN_PLATFORMS }}
       
       
       - name: Update Package.swift
@@ -101,42 +118,42 @@ jobs:
           cp -f ./dist/release/Package.swift ./Package.swift
 
 
-          LibmpvGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libmpv-GPL.xcframework.zip"
+          LibmpvGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libmpv-GPL.xcframework.zip"
           LibmpvGPL_checksum=$(cat ./dist/release/Libmpv-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libmpv-GPL_url)#${LibmpvGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libmpv-GPL_checksum)#${LibmpvGPL_checksum}#g" ./Package.swift
 
-          LibavcodecGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavcodec-GPL.xcframework.zip"
+          LibavcodecGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavcodec-GPL.xcframework.zip"
           LibavcodecGPL_checksum=$(cat ./dist/release/Libavcodec-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libavcodec-GPL_url)#${LibavcodecGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libavcodec-GPL_checksum)#${LibavcodecGPL_checksum}#g" ./Package.swift
 
-          LibavdeviceGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavdevice-GPL.xcframework.zip"
+          LibavdeviceGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavdevice-GPL.xcframework.zip"
           LibavdeviceGPL_checksum=$(cat ./dist/release/Libavdevice-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libavdevice-GPL_url)#${LibavdeviceGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libavdevice-GPL_checksum)#${LibavdeviceGPL_checksum}#g" ./Package.swift
 
-          LibavformatGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavformat-GPL.xcframework.zip"
+          LibavformatGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavformat-GPL.xcframework.zip"
           LibavformatGPL_checksum=$(cat ./dist/release/Libavformat-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libavformat-GPL_url)#${LibavformatGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libavformat-GPL_checksum)#${LibavformatGPL_checksum}#g" ./Package.swift
 
-          LibavfilterGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavfilter-GPL.xcframework.zip"
+          LibavfilterGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavfilter-GPL.xcframework.zip"
           LibavfilterGPL_checksum=$(cat ./dist/release/Libavfilter-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libavfilter-GPL_url)#${LibavfilterGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libavfilter-GPL_checksum)#${LibavfilterGPL_checksum}#g" ./Package.swift
 
-          LibavutilGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavutil-GPL.xcframework.zip"
+          LibavutilGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libavutil-GPL.xcframework.zip"
           LibavutilGPL_checksum=$(cat ./dist/release/Libavutil-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libavutil-GPL_url)#${LibavutilGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libavutil-GPL_checksum)#${LibavutilGPL_checksum}#g" ./Package.swift
 
-          LibswresampleGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libswresample-GPL.xcframework.zip"
+          LibswresampleGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libswresample-GPL.xcframework.zip"
           LibswresampleGPL_checksum=$(cat ./dist/release/Libswresample-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libswresample-GPL_url)#${LibswresampleGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libswresample-GPL_checksum)#${LibswresampleGPL_checksum}#g" ./Package.swift
 
-          LibswscaleGPL_url="https://github.com/mpvkit/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libswscale-GPL.xcframework.zip"
+          LibswscaleGPL_url="https://github.com/gokberkince/MPVKit/releases/download/${{ env.RELEASE_VERSION }}/Libswscale-GPL.xcframework.zip"
           LibswscaleGPL_checksum=$(cat ./dist/release/Libswscale-GPL.xcframework.checksum.txt)
           sed -i '' "s#\\\(Libswscale-GPL_url)#${LibswscaleGPL_url}#g" ./Package.swift
           sed -i '' "s#\\\(Libswscale-GPL_checksum)#${LibswscaleGPL_checksum}#g" ./Package.swift
