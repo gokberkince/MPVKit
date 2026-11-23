@@ -1,0 +1,115 @@
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -237,6 +237,12 @@
+ 
+     bool hwdec_request_reinit;
+     int hwdec_fail_count;
++    // Fork addition (Lumen): the NAME of a hwdec that actually produced frames for this stream.
++    // Empty until one does. It is the difference between "the system took my session away" and
++    // "this stream cannot be hardware decoded", and the name rather than a flag because after a
++    // fallback the end of `attempted_hwdecs` is some other method — a flag would resurrect the
++    // wrong one. See `try_restore_hwdec`.
++    bstr hwdec_succeeded;
+ 
+     struct mp_image_pool *hwdec_swpool;
+ 
+@@ -668,8 +674,62 @@
+ 
+     uninit_avctx(vd);
+     int lev = ctx->hwdec_notified ? MSGL_WARN : MSGL_V;
+-    mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
+-           BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
++    // Guarded: upstream can index the last entry unconditionally because nothing ever shortens
++    // this array. `try_restore_hwdec` does shorten it, so the list can be empty here.
++    if (ctx->num_attempted_hwdecs > 0) {
++        mp_msg(vd->log, lev, "Attempting next decoding method after failure of %.*s.\n",
++               BSTR_P(ctx->attempted_hwdecs[ctx->num_attempted_hwdecs - 1]));
++    }
++    select_and_set_hwdec(vd);
++    init_avctx(vd);
++}
++
++// Fork addition (Lumen): puts hardware decoding back after the system took its session away.
++//
++// iOS reclaims a VideoToolbox session from an app that is not in front — pulling Notification
++// Center over a running Picture in Picture window does it — and reports `kVTInvalidSessionErr`,
++// "Server session is gone". Upstream reads that as "this method does not work here": three failed
++// frames set `hwdec_failed`, `force_fallback` moves to the next method, and because the spent one
++// stays in `attempted_hwdecs` it is never reconsidered. One pull-down therefore dropped the whole
++// file into software decoding (owner's device, 2026-07-30). Apple's own answer to that error is to
++// build a new session, which is what WebRTC's iOS decoder does.
++//
++// Gated on a KEYFRAME, and that is the whole pacing mechanism — there is no timer and nothing
++// polls. It is also the only point where a new session can start cleanly: a decoder rebuilt in the
++// middle of a GOP has no reference frames and produces the "Could not find ref with POC" wreckage
++// that was in the same log. A GOP is a second or two, so recovery lands on the first keyframe
++// after the system is willing, and until then software carries the picture.
++//
++// Separate from `force_fallback` on purpose. That function's contract is "go forward", and
++// upstream's proof that `receive_frame` cannot spin rests on `attempted_hwdecs` only ever growing;
++// re-entering it from a shrinking list is how a patched version of this broke that guarantee.
++// This one runs from `send_packet`, and leaves a working `avctx` on every path.
++static void try_restore_hwdec(struct mp_filter *vd)
++{
++    vd_ffmpeg_ctx *ctx = vd->priv;
++
++    for (int i = 0; i < ctx->num_attempted_hwdecs; i++) {
++        if (!bstr_equals(ctx->attempted_hwdecs[i], ctx->hwdec_succeeded))
++            continue;
++        talloc_free(ctx->attempted_hwdecs[i].start);
++        MP_TARRAY_REMOVE_AT(ctx->attempted_hwdecs, ctx->num_attempted_hwdecs, i);
++        break;
++    }
++
++    uninit_avctx(vd);
++    select_and_set_hwdec(vd);
++    init_avctx(vd);
++    if (ctx->avctx && ctx->use_hwdec) {
++        MP_WARN(vd, "Recovered %.*s: its session was gone, not its stream.\n",
++                BSTR_P(ctx->hwdec_succeeded));
++        return;
++    }
++
++    // It did not come up — the system is still refusing. Put a decoder back before returning:
++    // every caller of this treats a NULL `avctx` as end of stream. The name is still remembered,
++    // so the next keyframe asks again.
++    MP_VERBOSE(vd, "Hardware decoding still unavailable; continuing in software.\n");
++    uninit_avctx(vd);
+     select_and_set_hwdec(vd);
+     init_avctx(vd);
+ }
+@@ -689,6 +749,10 @@
+     TA_FREEP(&ctx->attempted_hwdecs);
+     ctx->num_attempted_hwdecs = 0;
+     ctx->hwdec_notified = false;
++    // A new stream earns its own verdict: that hardware decoded the last file says nothing about
++    // whether it can decode this one.
++    talloc_free(ctx->hwdec_succeeded.start);
++    ctx->hwdec_succeeded = (bstr){0};
+ 
+     select_and_set_hwdec(vd);
+ 
+@@ -1171,6 +1235,12 @@
+ 
+     if (ctx->num_requeue_packets && ctx->requeue_packets[0] != pkt)
+         return AVERROR(EAGAIN); // cannot consume the packet
++
++    // A keyframe is both the pacing and the only clean place to rebuild — see `try_restore_hwdec`.
++    if (!ctx->use_hwdec && ctx->hwdec_succeeded.len && pkt && pkt->keyframe) {
++        try_restore_hwdec(vd);
++        avctx = ctx->avctx;
++    }
+ 
+     if (ctx->hwdec_failed)
+         return AVERROR(EAGAIN);
+@@ -1265,6 +1335,10 @@
+     }
+ 
+     ctx->hwdec_fail_count = 0;
++    // A frame came out of this hwdec, so the stream is one it can decode. From here a failure of
++    // this same method means its session was taken away — see `try_restore_hwdec`.
++    if (ctx->use_hwdec && !ctx->hwdec_succeeded.len)
++        ctx->hwdec_succeeded = bstrdup(ctx, bstr0(ctx->hwdec.name));
+ 
+     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
+     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
